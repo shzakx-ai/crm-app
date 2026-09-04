@@ -3,6 +3,10 @@ import os
 import sys
 import tempfile
 import pytest
+from pathlib import Path
+
+# Ensure project root is importable (CI runs from repo root, tests/ subdir)
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 # Use temp DB for tests
 _tmp = tempfile.mkdtemp(prefix="crm_test_")

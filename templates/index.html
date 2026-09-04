@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CRM App</title>
+<style>
+:root{--bg:#0f172a;--surface:#1e293b;--surface2:#334155;--border:#475569;--text:#f1f5f9;--muted:#94a3b8;--accent:#3b82f6;--accent2:#8b5cf6;--green:#22c55e;--red:#ef4444;--orange:#f59e0b;--radius:8px}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
+a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
+
+/* Layout */
+.app{display:flex;min-height:100vh}
+.sidebar{width:220px;background:var(--surface);border-right:1px solid var(--border);padding:16px 0;flex-shrink:0}
+.sidebar h1{font-size:18px;padding:0 16px 16px;border-bottom:1px solid var(--border)}
+.sidebar nav a{display:block;padding:10px 16px;color:var(--muted);font-size:14px;cursor:pointer;transition:all .2s}
+.sidebar nav a:hover,.sidebar nav a.active{background:var(--surface2);color:var(--text)}
+.sidebar nav a.active{border-left:3px solid var(--accent)}
+.main{flex:1;padding:24px;max-width:1200px;overflow-y:auto}
+
+/* Cards */
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:20px;margin-bottom:16px}
+.card h2{font-size:16px;margin-bottom:12px;color:var(--muted)}
+.stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:20px}
+.stat{background:var(--surface2);border-radius:var(--radius);padding:16px;text-align:center}
+.stat .num{font-size:28px;font-weight:700;color:var(--accent)}
+.stat .label{font-size:12px;color:var(--muted);margin-top:4px}
+
+/* Table */
+table{width:100%;border-collapse:collapse;font-size:14px}
+th{text-align:left;padding:10px 12px;border-bottom:2px solid var(--border);color:var(--muted);font-size:12px;text-transform:uppercase}
+td{padding:10px 12px;border-bottom:1px solid var(--border)}
+tr:hover{background:var(--surface2)}
+
+/* Badges */
+.badge{display:inline-block;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600}
+.badge-lead{background:#3b82f620;color:#60a5fa}
+.badge-prospect{background:#8b5cf620;color:#a78bfa}
+.badge-customer{background:#22c55e20;color:#4ade80}
+.badge-inactive{background:#64748b20;color:#94a3b8}
+.badge-won{background:#22c55e20;color:#4ade80}
+.badge-lost{background:#ef444420;color:#f87171}
+.badge-qualified{background:#f59e0b20;color:#fbbf24}
+.badge-proposal{background:#06b6d420;color:#22d3ee}
+.badge-negotiation{background:#f59e0b20;color:#fbbf24}
+
+/* Forms */
+.form-row{display:flex;gap:12px;margin-bottom:12px;flex-wrap:wrap}
+.form-group{flex:1;min-width:200px}
+.form-group label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px}
+.form-group input,.form-group select,.form-group textarea{width:100%;padding:8px 12px;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);color:var(--text);font-size:14px}
+.form-group textarea{min-height:60px;resize:vertical}
+.form-group input:focus,.form-group select:focus,.form-group textarea:focus{outline:none;border-color:var(--accent)}
+
+/* Buttons */
+.btn{display:inline-flex;align-items:center;gap:6px;padding:8px 16px;border:none;border-radius:var(--radius);font-size:14px;cursor:pointer;font-weight:500;transition:all .2s}
+.btn-primary{background:var(--accent);color:#fff}.btn-primary:hover{background:#2563eb}
+.btn-success{background:var(--green);color:#fff}.btn-success:hover{background:#16a34a}
+.btn-danger{background:var(--red);color:#fff}.btn-danger:hover{background:#dc2626}
+.btn-ghost{background:transparent;color:var(--muted);border:1px solid var(--border)}.btn-ghost:hover{background:var(--surface2)}
+.btn-sm{padding:4px 10px;font-size:12px}
+
+/* Search */
+.search-bar{display:flex;gap:8px;margin-bottom:16px}
+.search-bar input{flex:1;padding:10px 14px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);color:var(--text);font-size:14px}
+
+/* Modal */
+.modal-overlay{position:fixed;inset:0;background:#0008;z-index:100;display:none;align-items:center;justify-content:center}
+.modal-overlay.show{display:flex}
+.modal{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:24px;width:90%;max-width:600px;max-height:85vh;overflow-y:auto}
+.modal h3{margin-bottom:16px;font-size:18px}
+.modal-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:16px}
+
+/* Pipeline */
+.pipeline{display:flex;gap:8px;overflow-x:auto;padding:8px 0}
+.pipeline-col{flex:1;min-width:160px;background:var(--surface2);border-radius:var(--radius);padding:12px}
+.pipeline-col h4{font-size:12px;color:var(--muted);margin-bottom:8px;text-transform:uppercase}
+.pipeline-card{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:10px;margin-bottom:8px;font-size:13px}
+.pipeline-card .title{font-weight:600;margin-bottom:4px}
+.pipeline-card .value{color:var(--green);font-weight:600}
+.pipeline-card .contact{color:var(--muted);font-size:12px}
+
+.hidden{display:none}
+@media(max-width:768px){.sidebar{display:none}.main{padding:12px}}
+</style>
+</head>
+<body>
+<div class="app">
+<aside class="sidebar">
+  <h1>📊 CRM</h1>
+  <nav>
+    <a onclick="showView('dashboard')" class="active" id="nav-dashboard">Dashboard</a>
+    <a onclick="showView('contacts')" id="nav-contacts">Contacts</a>
+    <a onclick="showView('deals')" id="nav-deals">Deals</a>
+    <a onclick="showView('pipeline')" id="nav-pipeline">Pipeline</a>
+  </nav>
+</aside>
+<main class="main">
+
+<!-- ═══ Dashboard ═══ -->
+<div id="view-dashboard">
+  <h2 style="margin-bottom:16px">Dashboard</h2>
+  <div class="stats-grid" id="stats-grid"></div>
+</div>
+
+<!-- ═══ Contacts ═══ -->
+<div id="view-contacts" class="hidden">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+    <h2>Contacts</h2>
+    <button class="btn btn-primary" onclick="openContactModal()">+ New Contact</button>
+  </div>
+  <div class="search-bar">
+    <input id="contact-search" placeholder="Search contacts..." oninput="loadContacts()">
+    <select id="contact-filter" onchange="loadContacts()" style="padding:10px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);color:var(--text)">
+      <option value="">All Status</option>
+      <option value="lead">Lead</option>
+      <option value="prospect">Prospect</option>
+      <option value="customer">Customer</option>
+      <option value="inactive">Inactive</option>
+    </select>
+  </div>
+  <div class="card">
+    <table>
+      <thead><tr><th>Name</th><th>Email</th><th>Company</th><th>Status</th><th>Actions</th></tr></thead>
+      <tbody id="contacts-tbody"></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ═══ Deals ═══ -->
+<div id="view-deals" class="hidden">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+    <h2>Deals</h2>
+    <button class="btn btn-primary" onclick="openDealModal()">+ New Deal</button>
+  </div>
+  <div class="card">
+    <table>
+      <thead><tr><th>Title</th><th>Contact</th><th>Value</th><th>Stage</th><th>Actions</th></tr></thead>
+      <tbody id="deals-tbody"></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ═══ Pipeline ═══ -->
+<div id="view-pipeline" class="hidden">
+  <h2 style="margin-bottom:16px">Pipeline</h2>
+  <div class="pipeline" id="pipeline-board"></div>
+</div>
+
+</main>
+</div>
+
+<!-- ═══ Contact Modal ═══ -->
+<div class="modal-overlay" id="contact-modal">
+<div class="modal">
+  <h3 id="contact-modal-title">New Contact</h3>
+  <form id="contact-form" onsubmit="saveContact(event)">
+    <input type="hidden" id="cf-id">
+    <div class="form-row">
+      <div class="form-group"><label>First Name *</label><input id="cf-first" required></div>
+      <div class="form-group"><label>Last Name</label><input id="cf-last"></div>
+    </div>
+    <div class="form-row">
+      <div class="form-group"><label>Email</label><input id="cf-email" type="email"></div>
+      <div class="form-group"><label>Phone</label><input id="cf-phone"></div>
+    </div>
+    <div class="form-row">
+      <div class="form-group"><label>Company</label><input id="cf-company"></div>
+      <div class="form-group"><label>Position</label><input id="cf-position"></div>
+    </div>
+    <div class="form-row">
+      <div class="form-group"><label>Status</label>
+        <select id="cf-status">
+          <option value="lead">Lead</option><option value="prospect">Prospect</option>
+          <option value="customer">Customer</option><option value="inactive">Inactive</option>
+        </select>
+      </div>
+      <div class="form-group"><label>Source</label><input id="cf-source" placeholder="website, referral..."></div>
+    </div>
+    <div class="form-group"><label>Notes</label><textarea id="cf-notes"></textarea></div>
+    <div class="modal-actions">
+      <button type="button" class="btn btn-ghost" onclick="closeModal('contact-modal')">Cancel</button>
+      <button type="submit" class="btn btn-primary">Save</button>
+    </div>
+  </form>
+</div>
+</div>
+
+<!-- ═══ Deal Modal ═══ -->
+<div class="modal-overlay" id="deal-modal">
+<div class="modal">
+  <h3 id="deal-modal-title">New Deal</h3>
+  <form id="deal-form" onsubmit="saveDeal(event)">
+    <input type="hidden" id="df-id">
+    <div class="form-row">
+      <div class="form-group"><label>Contact *</label>
+        <select id="df-contact" required></select>
+      </div>
+      <div class="form-group"><label>Title *</label><input id="df-title" required></div>
+    </div>
+    <div class="form-row">
+      <div class="form-group"><label>Value (EUR)</label><input id="df-value" type="number" step="0.01" value="0"></div>
+      <div class="form-group"><label>Stage</label>
+        <select id="df-stage">
+          <option value="lead">Lead</option><option value="qualified">Qualified</option>
+          <option value="proposal">Proposal</option><option value="negotiation">Negotiation</option>
+          <option value="won">Won</option><option value="lost">Lost</option>
+        </select>
+      </div>
+    </div>
+    <div class="form-group"><label>Notes</label><textarea id="df-notes"></textarea></div>
+    <div class="modal-actions">
+      <button type="button" class="btn btn-ghost" onclick="closeModal('deal-modal')">Cancel</button>
+      <button type="submit" class="btn btn-primary">Save</button>
+    </div>
+  </form>
+</div>
+</div>
+
+<script>
+const API = '';
+
+// ── Navigation ──
+function showView(name){
+  document.querySelectorAll('[id^="view-"]').forEach(v=>v.classList.add('hidden'));
+  document.querySelectorAll('.sidebar nav a').forEach(a=>a.classList.remove('active'));
+  document.getElementById('view-'+name).classList.remove('hidden');
+  document.getElementById('nav-'+name).classList.add('active');
+  if(name==='dashboard') loadDashboard();
+  if(name==='contacts') loadContacts();
+  if(name==='deals') loadDeals();
+  if(name==='pipeline') loadPipeline();
+}
+
+// ── Dashboard ──
+async function loadDashboard(){
+  const r = await fetch(API+'/api/stats');
+  const s = await r.json();
+  const grid = document.getElementById('stats-grid');
+  grid.innerHTML = `
+    <div class="stat"><div class="num">${s.total_contacts}</div><div class="label">Total Contacts</div></div>
+    <div class="stat"><div class="num">${s.by_status?.customer||0}</div><div class="label">Customers</div></div>
+    <div class="stat"><div class="num">${s.by_status?.lead||0}</div><div class="label">Leads</div></div>
+    <div class="stat"><div class="num">${s.open_deals}</div><div class="label">Open Deals</div></div>
+    <div class="stat"><div class="num">€${(s.won_value||0).toLocaleString()}</div><div class="label">Won Revenue</div></div>
+    <div class="stat"><div class="num" style="color:${s.overdue_tasks?'var(--red)':'var(--green)'}">${s.overdue_tasks}</div><div class="label">Overdue Tasks</div></div>
+  `;
+}
+
+// ── Contacts ──
+async function loadContacts(){
+  const search = document.getElementById('contact-search').value;
+  const status = document.getElementById('contact-filter').value;
+  const r = await fetch(API+`/api/contacts?search=${encodeURIComponent(search)}&status=${status}`);
+  const d = await r.json();
+  const tbody = document.getElementById('contacts-tbody');
+  tbody.innerHTML = d.contacts.map(c=>`
+    <tr>
+      <td><strong>${esc(c.first_name)} ${esc(c.last_name)}</strong></td>
+      <td>${esc(c.email)}</td>
+      <td>${esc(c.company)}</td>
+      <td><span class="badge badge-${c.status}">${c.status}</span></td>
+      <td>
+        <button class="btn btn-ghost btn-sm" onclick="editContact(${c.id})">Edit</button>
+        <button class="btn btn-danger btn-sm" onclick="deleteContact(${c.id})">Del</button>
+      </td>
+    </tr>
+  `).join('');
+}
+
+function openContactModal(c){
+  document.getElementById('cf-id').value = c?.id||'';
+  document.getElementById('cf-first').value = c?.first_name||'';
+  document.getElementById('cf-last').value = c?.last_name||'';
+  document.getElementById('cf-email').value = c?.email||'';
+  document.getElementById('cf-phone').value = c?.phone||'';
+  document.getElementById('cf-company').value = c?.company||'';
+  document.getElementById('cf-position').value = c?.position||'';
+  document.getElementById('cf-status').value = c?.status||'lead';
+  document.getElementById('cf-source').value = c?.source||'';
+  document.getElementById('cf-notes').value = c?.notes||'';
+  document.getElementById('contact-modal-title').textContent = c ? 'Edit Contact' : 'New Contact';
+  document.getElementById('contact-modal').classList.add('show');
+}
+
+async function editContact(id){
+  const r = await fetch(API+`/api/contacts/${id}`);
+  const d = await r.json();
+  openContactModal(d.contact);
+}
+
+async function saveContact(e){
+  e.preventDefault();
+  const id = document.getElementById('cf-id').value;
+  const data = {
+    first_name: document.getElementById('cf-first').value,
+    last_name: document.getElementById('cf-last').value,
+    email: document.getElementById('cf-email').value,
+    phone: document.getElementById('cf-phone').value,
+    company: document.getElementById('cf-company').value,
+    position: document.getElementById('cf-position').value,
+    status: document.getElementById('cf-status').value,
+    source: document.getElementById('cf-source').value,
+    notes: document.getElementById('cf-notes').value,
+  };
+  if(id){
+    await fetch(API+`/api/contacts/${id}`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
+  } else {
+    const fd = new FormData();
+    for(const[k,v] of Object.entries(data)) fd.append(k,v);
+    await fetch(API+'/api/contacts',{method:'POST',body:fd});
+  }
+  closeModal('contact-modal');
+  loadContacts();
+}
+
+async function deleteContact(id){
+  if(!confirm('Delete this contact?')) return;
+  await fetch(API+`/api/contacts/${id}`,{method:'DELETE'});
+  loadContacts();
+}
+
+// ── Deals ──
+async function loadDeals(){
+  const r = await fetch(API+'/api/deals');
+  const d = await r.json();
+  const tbody = document.getElementById('deals-tbody');
+  tbody.innerHTML = d.deals.map(dl=>`
+    <tr>
+      <td><strong>${esc(dl.title)}</strong></td>
+      <td>${esc(dl.contact_name)}</td>
+      <td style="color:var(--green)">€${(dl.value||0).toLocaleString()}</td>
+      <td><span class="badge badge-${dl.stage}">${dl.stage}</span></td>
+      <td>
+        <button class="btn btn-ghost btn-sm" onclick="advanceDeal(${dl.id},'${dl.stage}')">▶ Next</button>
+        <button class="btn btn-danger btn-sm" onclick="deleteDeal(${dl.id})">Del</button>
+      </td>
+    </tr>
+  `).join('');
+}
+
+async function openDealModal(){
+  // load contacts for dropdown
+  const r = await fetch(API+'/api/contacts?limit=200');
+  const d = await r.json();
+  const sel = document.getElementById('df-contact');
+  sel.innerHTML = d.contacts.map(c=>`<option value="${c.id}">${esc(c.first_name)} ${esc(c.last_name)}</option>`).join('');
+  document.getElementById('df-id').value = '';
+  document.getElementById('df-title').value = '';
+  document.getElementById('df-value').value = '0';
+  document.getElementById('df-stage').value = 'lead';
+  document.getElementById('df-notes').value = '';
+  document.getElementById('deal-modal-title').textContent = 'New Deal';
+  document.getElementById('deal-modal').classList.add('show');
+}
+
+async function saveDeal(e){
+  e.preventDefault();
+  const fd = new FormData();
+  fd.append('contact_id', document.getElementById('df-contact').value);
+  fd.append('title', document.getElementById('df-title').value);
+  fd.append('value', document.getElementById('df-value').value);
+  fd.append('stage', document.getElementById('df-stage').value);
+  fd.append('notes', document.getElementById('df-notes').value);
+  await fetch(API+'/api/deals',{method:'POST',body:fd});
+  closeModal('deal-modal');
+  loadDeals();
+}
+
+const STAGES = ['lead','qualified','proposal','negotiation','won','lost'];
+async function advanceDeal(id, stage){
+  const idx = STAGES.indexOf(stage);
+  if(idx < 0 || idx >= STAGES.length-1) return;
+  await fetch(API+`/api/deals/${id}`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({stage:STAGES[idx+1]})});
+  loadDeals();
+}
+
+async function deleteDeal(id){
+  if(!confirm('Delete this deal?')) return;
+  await fetch(API+`/api/deals/${id}`,{method:'DELETE'});
+  loadDeals();
+}
+
+// ── Pipeline ──
+async function loadPipeline(){
+  const r = await fetch(API+'/api/deals');
+  const d = await r.json();
+  const board = document.getElementById('pipeline-board');
+  const stageLabels = {lead:'Lead',qualified:'Qualified',proposal:'Proposal',negotiation:'Negotiation',won:'Won',lost:'Lost'};
+  board.innerHTML = STAGES.map(s=>{
+    const deals = d.deals.filter(dl=>dl.stage===s);
+    const total = deals.reduce((a,dl)=>a+(dl.value||0),0);
+    return `<div class="pipeline-col">
+      <h4>${stageLabels[s]} (${deals.length}) — €${total.toLocaleString()}</h4>
+      ${deals.map(dl=>`
+        <div class="pipeline-card">
+          <div class="title">${esc(dl.title)}</div>
+          <div class="value">€${(dl.value||0).toLocaleString()}</div>
+          <div class="contact">${esc(dl.contact_name)}</div>
+        </div>
+      `).join('')}
+    </div>`;
+  }).join('');
+}
+
+// ── Helpers ──
+function closeModal(id){document.getElementById(id).classList.remove('show')}
+function esc(s){return(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
+
+// Close modals on overlay click
+document.querySelectorAll('.modal-overlay').forEach(m=>{
+  m.addEventListener('click',e=>{if(e.target===m) m.classList.remove('show')});
+});
+
+// Load dashboard on start
+loadDashboard();
+</script>
+</body>
+</html>

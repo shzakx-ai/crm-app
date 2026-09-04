@@ -1,0 +1,13 @@
+services:
+  crm:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - crm-data:/app/data
+    environment:
+      - CRM_DB=/app/data/crm.db
+    restart: unless-stopped
+
+volumes:
+  crm-data:

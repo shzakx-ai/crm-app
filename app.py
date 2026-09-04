@@ -1,22 +1,85 @@
 #!/usr/bin/env python3
 """
-CRM App — Lightweight Customer Relationship Management
-Built with FastAPI + SQLite. Docker-ready.
+CRM App v2 — Production-ready with Auth + Validation
+FastAPI + SQLite + Pydantic. Docker-ready.
 """
 import os
 import sqlite3
-import json
-from datetime import datetime, date
+from datetime import datetime
 from contextlib import contextmanager
 
-from fastapi import FastAPI, HTTPException, Request, Form
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
+from fastapi import FastAPI, HTTPException, Request, Depends
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from fastapi.security import OAuth2PasswordBearer
+from pydantic import BaseModel, Field, EmailStr
+from typing import Optional, List, Dict, Any
+
+# ── Config ────────────────────────────────────────────────────────────────
+DB_PATH = os.environ.get("CRM_DB", "crm.db")
+API_TOKEN = os.environ.get("CRM_API_TOKEN", "crm-dev-token-2026")
+
+# ── Security ──────────────────────────────────────────────────────────────
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
+async def get_current_token(token: str = Depends(oauth2_scheme)):
+    if token != API_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    return token
+
+# ── App ───────────────────────────────────────────────────────────────────
+app = FastAPI(title="CRM App", version="2.0.0")
+app.mount("/static", StaticFiles(directory="static"), name="static")
+templates = Jinja2Templates(directory="templates")
+
+# ── Pydantic Models ───────────────────────────────────────────────────────
+class ContactCreate(BaseModel):
+    first_name: str = Field(..., min_length=1, max_length=50)
+    last_name: str = Field(default="", max_length=50)
+    email: Optional[EmailStr] = None
+    phone: Optional[str] = Field(default=None, max_length=30)
+    company: Optional[str] = Field(default=None, max_length=100)
+    position: Optional[str] = Field(default=None, max_length=100)
+    status: str = Field(default="lead", pattern=r"^(lead|prospect|customer|inactive)$")
+    source: Optional[str] = Field(default=None, max_length=100)
+    notes: Optional[str] = Field(default=None, max_length=500)
+
+class ContactUpdate(BaseModel):
+    first_name: Optional[str] = Field(default=None, min_length=1, max_length=50)
+    last_name: Optional[str] = Field(default=None, max_length=50)
+    email: Optional[EmailStr] = None
+    phone: Optional[str] = Field(default=None, max_length=30)
+    company: Optional[str] = Field(default=None, max_length=100)
+    position: Optional[str] = Field(default=None, max_length=100)
+    status: Optional[str] = Field(default=None, pattern=r"^(lead|prospect|customer|inactive)$")
+    source: Optional[str] = Field(default=None, max_length=100)
+    notes: Optional[str] = Field(default=None, max_length=500)
+
+class DealCreate(BaseModel):
+    contact_id: int = Field(..., ge=1)
+    title: str = Field(..., min_length=1, max_length=200)
+    value: float = Field(default=0, ge=0)
+    stage: str = Field(default="lead", pattern=r"^(lead|qualified|proposal|negotiation|won|lost)$")
+    expected_close: Optional[str] = Field(default=None, max_length=50)
+    notes: Optional[str] = Field(default=None, max_length=500)
+
+class DealUpdate(BaseModel):
+    title: Optional[str] = Field(default=None, min_length=1, max_length=200)
+    value: Optional[float] = Field(default=None, ge=0)
+    stage: Optional[str] = Field(default=None, pattern=r"^(lead|qualified|proposal|negotiation|won|lost)$")
+    expected_close: Optional[str] = Field(default=None, max_length=50)
+    notes: Optional[str] = Field(default=None, max_length=500)
+
+class ActivityCreate(BaseModel):
+    contact_id: int = Field(..., ge=1)
+    deal_id: Optional[int] = None
+    type: str = Field(default="note", pattern=r"^(note|call|email|meeting|task)$")
+    subject: Optional[str] = Field(default=None, max_length=200)
+    body: Optional[str] = Field(default=None, max_length=1000)
+    due_date: Optional[str] = Field(default=None, max_length=50)
 
 # ── Database ──────────────────────────────────────────────────────────────
-DB_PATH = os.environ.get("CRM_DB", "crm.db")
-
 @contextmanager
 def get_db():
     conn = sqlite3.connect(DB_PATH)
@@ -80,14 +143,20 @@ def init_db():
 
 init_db()
 
-# ── App ───────────────────────────────────────────────────────────────────
-app = FastAPI(title="CRM App", version="1.0.0")
-app.mount("/static", StaticFiles(directory="static"), name="static")
-templates = Jinja2Templates(directory="templates")
+# ── API: Auth ─────────────────────────────────────────────────────────────
+@app.get("/token")
+async def get_token():
+    return {"access_token": API_TOKEN, "token_type": "bearer"}
 
 # ── API: Contacts ─────────────────────────────────────────────────────────
 @app.get("/api/contacts")
-def list_contacts(search: str = "", status: str = "", limit: int = 100, offset: int = 0):
+async def list_contacts(
+    search: str = "",
+    status: str = "",
+    limit: int = 100,
+    offset: int = 0,
+    token: str = Depends(get_current_token),
+):
     with get_db() as db:
         q = "SELECT * FROM contacts WHERE 1=1"
         params = []
@@ -105,27 +174,23 @@ def list_contacts(search: str = "", status: str = "", limit: int = 100, offset: 
         return {"contacts": rows, "total": total}
 
 @app.post("/api/contacts")
-def create_contact(
-    first_name: str = Form(...),
-    last_name: str = Form(""),
-    email: str = Form(""),
-    phone: str = Form(""),
-    company: str = Form(""),
-    position: str = Form(""),
-    status: str = Form("lead"),
-    source: str = Form(""),
-    notes: str = Form(""),
+async def create_contact(
+    c: ContactCreate,
+    token: str = Depends(get_current_token),
 ):
     with get_db() as db:
         cur = db.execute(
             """INSERT INTO contacts (first_name,last_name,email,phone,company,position,status,source,notes)
                VALUES (?,?,?,?,?,?,?,?,?)""",
-            (first_name, last_name, email, phone, company, position, status, source, notes),
+            (c.first_name, c.last_name, c.email, c.phone, c.company, c.position, c.status, c.source, c.notes),
         )
         return {"id": cur.lastrowid, "ok": True}
 
 @app.get("/api/contacts/{cid}")
-def get_contact(cid: int):
+async def get_contact(
+    cid: int,
+    token: str = Depends(get_current_token),
+):
     with get_db() as db:
         row = db.execute("SELECT * FROM contacts WHERE id=?", (cid,)).fetchone()
         if not row:
@@ -135,35 +200,40 @@ def get_contact(cid: int):
         return {"contact": dict(row), "deals": deals, "activities": activities}
 
 @app.put("/api/contacts/{cid}")
-def update_contact(cid: int, request: Request):
-    import asyncio
-    async def _update():
-        data = await request.json()
-        fields = ["first_name","last_name","email","phone","company","position","status","source","notes"]
-        sets = []
-        params = []
-        for f in fields:
-            if f in data:
-                sets.append(f"{f}=?")
-                params.append(data[f])
-        if not sets:
+async def update_contact(
+    cid: int,
+    c: ContactUpdate,
+    token: str = Depends(get_current_token),
+):
+    with get_db() as db:
+        row = db.execute("SELECT id FROM contacts WHERE id=?", (cid,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Contact not found")
+        data = c.model_dump(exclude_unset=True)
+        if not data:
             raise HTTPException(400, "No fields to update")
-        sets.append("updated_at=datetime('now')")
-        params.append(cid)
-        with get_db() as db:
-            db.execute(f"UPDATE contacts SET {','.join(sets)} WHERE id=?", params)
-        return {"ok": True}
-    return asyncio.get_event_loop().run_until_complete(_update())
+        sets = [f"{k}=?" for k in data]
+        params = list(data.values()) + [cid]
+        db.execute(f"UPDATE contacts SET {','.join(sets)},updated_at=datetime('now') WHERE id=?", params)
+        updated = db.execute("SELECT * FROM contacts WHERE id=?", (cid,)).fetchone()
+        return {"ok": True, "contact": dict(updated)}
 
 @app.delete("/api/contacts/{cid}")
-def delete_contact(cid: int):
+async def delete_contact(
+    cid: int,
+    token: str = Depends(get_current_token),
+):
     with get_db() as db:
         db.execute("DELETE FROM contacts WHERE id=?", (cid,))
     return {"ok": True}
 
 # ── API: Deals ────────────────────────────────────────────────────────────
 @app.get("/api/deals")
-def list_deals(stage: str = "", limit: int = 100):
+async def list_deals(
+    stage: str = "",
+    limit: int = 100,
+    token: str = Depends(get_current_token),
+):
     with get_db() as db:
         q = """SELECT d.*, c.first_name||' '||c.last_name as contact_name
                FROM deals d JOIN contacts c ON d.contact_id=c.id WHERE 1=1"""
@@ -176,74 +246,75 @@ def list_deals(stage: str = "", limit: int = 100):
         return {"deals": [dict(r) for r in db.execute(q, params).fetchall()]}
 
 @app.post("/api/deals")
-def create_deal(
-    contact_id: int = Form(...),
-    title: str = Form(...),
-    value: float = Form(0),
-    stage: str = Form("lead"),
-    expected_close: str = Form(""),
-    notes: str = Form(""),
+async def create_deal(
+    d: DealCreate,
+    token: str = Depends(get_current_token),
 ):
     with get_db() as db:
+        contact = db.execute("SELECT id FROM contacts WHERE id=?", (d.contact_id,)).fetchone()
+        if not contact:
+            raise HTTPException(404, "Contact not found")
         cur = db.execute(
             "INSERT INTO deals (contact_id,title,value,stage,expected_close,notes) VALUES (?,?,?,?,?,?)",
-            (contact_id, title, value, stage, expected_close, notes),
+            (d.contact_id, d.title, d.value, d.stage, d.expected_close, d.notes),
         )
         return {"id": cur.lastrowid, "ok": True}
 
 @app.put("/api/deals/{did}")
-def update_deal(did: int, request: Request):
-    import asyncio
-    async def _update():
-        data = await request.json()
-        fields = ["title","value","stage","expected_close","notes"]
-        sets = []
-        params = []
-        for f in fields:
-            if f in data:
-                sets.append(f"{f}=?")
-                params.append(data[f])
-        if not sets:
-            raise HTTPException(400, "No fields")
-        sets.append("updated_at=datetime('now')")
-        params.append(did)
-        with get_db() as db:
-            db.execute(f"UPDATE deals SET {','.join(sets)} WHERE id=?", params)
+async def update_deal(
+    did: int,
+    d: DealUpdate,
+    token: str = Depends(get_current_token),
+):
+    with get_db() as db:
+        drow = db.execute("SELECT id FROM deals WHERE id=?", (did,)).fetchone()
+        if not drow:
+            raise HTTPException(404, "Deal not found")
+        data = d.model_dump(exclude_unset=True)
+        if not data:
+            raise HTTPException(400, "No fields to update")
+        sets = [f"{k}=?" for k in data]
+        params = list(data.values()) + [did]
+        db.execute(f"UPDATE deals SET {','.join(sets)},updated_at=datetime('now') WHERE id=?", params)
         return {"ok": True}
-    return asyncio.get_event_loop().run_until_complete(_update())
 
 @app.delete("/api/deals/{did}")
-def delete_deal(did: int):
+async def delete_deal(
+    did: int,
+    token: str = Depends(get_current_token),
+):
     with get_db() as db:
         db.execute("DELETE FROM deals WHERE id=?", (did,))
     return {"ok": True}
 
 # ── API: Activities ───────────────────────────────────────────────────────
 @app.post("/api/activities")
-def create_activity(
-    contact_id: int = Form(...),
-    deal_id: int = Form(0),
-    type: str = Form("note"),
-    subject: str = Form(""),
-    body: str = Form(""),
-    due_date: str = Form(""),
+async def create_activity(
+    a: ActivityCreate,
+    token: str = Depends(get_current_token),
 ):
     with get_db() as db:
+        contact = db.execute("SELECT id FROM contacts WHERE id=?", (a.contact_id,)).fetchone()
+        if not contact:
+            raise HTTPException(404, "Contact not found")
         cur = db.execute(
             "INSERT INTO activities (contact_id,deal_id,type,subject,body,due_date) VALUES (?,?,?,?,?,?)",
-            (contact_id, deal_id or None, type, subject, body, due_date),
+            (a.contact_id, a.deal_id, a.type, a.subject, a.body, a.due_date),
         )
         return {"id": cur.lastrowid, "ok": True}
 
 @app.put("/api/activities/{aid}/done")
-def mark_activity_done(aid: int):
+async def mark_activity_done(
+    aid: int,
+    token: str = Depends(get_current_token),
+):
     with get_db() as db:
         db.execute("UPDATE activities SET done=1 WHERE id=?", (aid,))
     return {"ok": True}
 
 # ── API: Dashboard Stats ──────────────────────────────────────────────────
 @app.get("/api/stats")
-def get_stats():
+async def get_stats(token: str = Depends(get_current_token)):
     with get_db() as db:
         total = db.execute("SELECT COUNT(*) FROM contacts").fetchone()[0]
         by_status = {r[0]: r[1] for r in db.execute("SELECT status, COUNT(*) FROM contacts GROUP BY status").fetchall()}
@@ -264,7 +335,7 @@ def get_stats():
 
 # ── Frontend ──────────────────────────────────────────────────────────────
 @app.get("/", response_class=HTMLResponse)
-def index(request: Request):
+async def index(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
 
 if __name__ == "__main__":

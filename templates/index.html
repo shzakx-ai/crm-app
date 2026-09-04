@@ -220,6 +220,15 @@ tr:hover{background:var(--surface2)}
 
 <script>
 const API = '';
+const TOKEN = '{{ crm_token }}';  // injected by Jinja2 template from server
+
+// ── Auth helper ──
+function api(path, opts={}) {
+  const headers = opts.headers || {};
+  headers['Authorization'] = 'Bearer ' + TOKEN;
+  if (opts.body && typeof opts.body === 'string') headers['Content-Type'] = 'application/json';
+  return fetch(API + path, {...opts, headers});
+}
 
 // ── Navigation ──
 function showView(name){
@@ -235,7 +244,8 @@ function showView(name){
 
 // ── Dashboard ──
 async function loadDashboard(){
-  const r = await fetch(API+'/api/stats');
+  const r = await api('/api/stats');
+  if (r.status === 401) return showAuthError();
   const s = await r.json();
   const grid = document.getElementById('stats-grid');
   grid.innerHTML = `
@@ -248,11 +258,17 @@ async function loadDashboard(){
   `;
 }
 
+function showAuthError(){
+  const grid = document.getElementById('stats-grid');
+  grid.innerHTML = '<div class="card"><h2 style="color:var(--red)">❌ Unauthorized</h2><p>Set CRM_API_TOKEN env var to match the server token.</p></div>';
+}
+
 // ── Contacts ──
 async function loadContacts(){
   const search = document.getElementById('contact-search').value;
   const status = document.getElementById('contact-filter').value;
-  const r = await fetch(API+`/api/contacts?search=${encodeURIComponent(search)}&status=${status}`);
+  const r = await api(`/api/contacts?search=${encodeURIComponent(search)}&status=${status}`);
+  if (r.status === 401) return showAuthError();
   const d = await r.json();
   const tbody = document.getElementById('contacts-tbody');
   tbody.innerHTML = d.contacts.map(c=>`
@@ -285,7 +301,7 @@ function openContactModal(c){
 }
 
 async function editContact(id){
-  const r = await fetch(API+`/api/contacts/${id}`);
+  const r = await api(`/api/contacts/${id}`);
   const d = await r.json();
   openContactModal(d.contact);
 }
@@ -305,11 +321,9 @@ async function saveContact(e){
     notes: document.getElementById('cf-notes').value,
   };
   if(id){
-    await fetch(API+`/api/contacts/${id}`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
+    await api(`/api/contacts/${id}`,{method:'PUT',body:JSON.stringify(data)});
   } else {
-    const fd = new FormData();
-    for(const[k,v] of Object.entries(data)) fd.append(k,v);
-    await fetch(API+'/api/contacts',{method:'POST',body:fd});
+    await api('/api/contacts',{method:'POST',body:JSON.stringify(data)});
   }
   closeModal('contact-modal');
   loadContacts();
@@ -317,13 +331,14 @@ async function saveContact(e){
 
 async function deleteContact(id){
   if(!confirm('Delete this contact?')) return;
-  await fetch(API+`/api/contacts/${id}`,{method:'DELETE'});
+  await api(`/api/contacts/${id}`,{method:'DELETE'});
   loadContacts();
 }
 
 // ── Deals ──
 async function loadDeals(){
-  const r = await fetch(API+'/api/deals');
+  const r = await api('/api/deals');
+  if (r.status === 401) return showAuthError();
   const d = await r.json();
   const tbody = document.getElementById('deals-tbody');
   tbody.innerHTML = d.deals.map(dl=>`
@@ -342,7 +357,7 @@ async function loadDeals(){
 
 async function openDealModal(){
   // load contacts for dropdown
-  const r = await fetch(API+'/api/contacts?limit=200');
+  const r = await api('/api/contacts?limit=200');
   const d = await r.json();
   const sel = document.getElementById('df-contact');
   sel.innerHTML = d.contacts.map(c=>`<option value="${c.id}">${esc(c.first_name)} ${esc(c.last_name)}</option>`).join('');
@@ -357,13 +372,14 @@ async function openDealModal(){
 
 async function saveDeal(e){
   e.preventDefault();
-  const fd = new FormData();
-  fd.append('contact_id', document.getElementById('df-contact').value);
-  fd.append('title', document.getElementById('df-title').value);
-  fd.append('value', document.getElementById('df-value').value);
-  fd.append('stage', document.getElementById('df-stage').value);
-  fd.append('notes', document.getElementById('df-notes').value);
-  await fetch(API+'/api/deals',{method:'POST',body:fd});
+  const data = {
+    contact_id: parseInt(document.getElementById('df-contact').value),
+    title: document.getElementById('df-title').value,
+    value: parseFloat(document.getElementById('df-value').value) || 0,
+    stage: document.getElementById('df-stage').value,
+    notes: document.getElementById('df-notes').value,
+  };
+  await api('/api/deals',{method:'POST',body:JSON.stringify(data)});
   closeModal('deal-modal');
   loadDeals();
 }
@@ -372,19 +388,20 @@ const STAGES = ['lead','qualified','proposal','negotiation','won','lost'];
 async function advanceDeal(id, stage){
   const idx = STAGES.indexOf(stage);
   if(idx < 0 || idx >= STAGES.length-1) return;
-  await fetch(API+`/api/deals/${id}`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({stage:STAGES[idx+1]})});
+  await api(`/api/deals/${id}`,{method:'PUT',body:JSON.stringify({stage:STAGES[idx+1]})});
   loadDeals();
 }
 
 async function deleteDeal(id){
   if(!confirm('Delete this deal?')) return;
-  await fetch(API+`/api/deals/${id}`,{method:'DELETE'});
+  await api(`/api/deals/${id}`,{method:'DELETE'});
   loadDeals();
 }
 
 // ── Pipeline ──
 async function loadPipeline(){
-  const r = await fetch(API+'/api/deals');
+  const r = await api('/api/deals');
+  if (r.status === 401) return showAuthError();
   const d = await r.json();
   const board = document.getElementById('pipeline-board');
   const stageLabels = {lead:'Lead',qualified:'Qualified',proposal:'Proposal',negotiation:'Negotiation',won:'Won',lost:'Lost'};

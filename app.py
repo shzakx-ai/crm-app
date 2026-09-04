@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-CRM App v2 — Production-ready with Auth + Validation
+CRM App v2.1 — Fixed: auth, frontend sync, email-validator, JSON payloads
 FastAPI + SQLite + Pydantic. Docker-ready.
 """
 import os
 import sqlite3
+import secrets
 from datetime import datetime
 from contextlib import contextmanager
 
@@ -13,12 +14,13 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi.security import OAuth2PasswordBearer
-from pydantic import BaseModel, Field, EmailStr
+from pydantic import BaseModel, Field, field_validator
 from typing import Optional, List, Dict, Any
 
 # ── Config ────────────────────────────────────────────────────────────────
 DB_PATH = os.environ.get("CRM_DB", "crm.db")
-API_TOKEN = os.environ.get("CRM_API_TOKEN", "crm-dev-token-2026")
+# Generate token once at startup — never hardcoded, never exposed via API
+API_TOKEN = os.environ.get("CRM_API_TOKEN") or secrets.token_urlsafe(32)
 
 # ── Security ──────────────────────────────────────────────────────────────
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
@@ -29,7 +31,7 @@ async def get_current_token(token: str = Depends(oauth2_scheme)):
     return token
 
 # ── App ───────────────────────────────────────────────────────────────────
-app = FastAPI(title="CRM App", version="2.0.0")
+app = FastAPI(title="CRM App", version="2.1.0")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
 
@@ -37,7 +39,7 @@ templates = Jinja2Templates(directory="templates")
 class ContactCreate(BaseModel):
     first_name: str = Field(..., min_length=1, max_length=50)
     last_name: str = Field(default="", max_length=50)
-    email: Optional[EmailStr] = None
+    email: Optional[str] = Field(default=None, max_length=100)
     phone: Optional[str] = Field(default=None, max_length=30)
     company: Optional[str] = Field(default=None, max_length=100)
     position: Optional[str] = Field(default=None, max_length=100)
@@ -45,10 +47,20 @@ class ContactCreate(BaseModel):
     source: Optional[str] = Field(default=None, max_length=100)
     notes: Optional[str] = Field(default=None, max_length=500)
 
+    @field_validator('email')
+    @classmethod
+    def validate_email(cls, v):
+        if v is None or v == '':
+            return v
+        # Minimal email validation (no external dependency)
+        if '@' not in v or '.' not in v.split('@')[-1]:
+            raise ValueError(f'Invalid email: {v}')
+        return v
+
 class ContactUpdate(BaseModel):
     first_name: Optional[str] = Field(default=None, min_length=1, max_length=50)
     last_name: Optional[str] = Field(default=None, max_length=50)
-    email: Optional[EmailStr] = None
+    email: Optional[str] = Field(default=None, max_length=100)
     phone: Optional[str] = Field(default=None, max_length=30)
     company: Optional[str] = Field(default=None, max_length=100)
     position: Optional[str] = Field(default=None, max_length=100)
@@ -142,11 +154,6 @@ def init_db():
         """)
 
 init_db()
-
-# ── API: Auth ─────────────────────────────────────────────────────────────
-@app.get("/token")
-async def get_token():
-    return {"access_token": API_TOKEN, "token_type": "bearer"}
 
 # ── API: Contacts ─────────────────────────────────────────────────────────
 @app.get("/api/contacts")
@@ -336,7 +343,10 @@ async def get_stats(token: str = Depends(get_current_token)):
 # ── Frontend ──────────────────────────────────────────────────────────────
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
+    return templates.TemplateResponse("index.html", {
+        "request": request,
+        "crm_token": API_TOKEN,
+    })
 
 if __name__ == "__main__":
     import uvicorn

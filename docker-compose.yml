@@ -5,6 +5,8 @@ services:
       - "8000:8000"
     volumes:
       - crm-data:/app/data
+    env_file:
+      - .env
     environment:
       - CRM_DB=/app/data/crm.db
     restart: unless-stopped

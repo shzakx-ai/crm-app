@@ -220,14 +220,11 @@ tr:hover{background:var(--surface2)}
 
 <script>
 const API = '';
-const TOKEN = '{{ crm_token }}';  // injected by Jinja2 template from server
+// No token in JS — session cookie is HttpOnly, sent automatically by the browser.
 
-// ── Auth helper ──
+// ── Auth helper: rely on session cookie (fetch sends it automatically) ──
 function api(path, opts={}) {
-  const headers = opts.headers || {};
-  headers['Authorization'] = 'Bearer ' + TOKEN;
-  if (opts.body && typeof opts.body === 'string') headers['Content-Type'] = 'application/json';
-  return fetch(API + path, {...opts, headers});
+  return fetch(API + path, {...opts, credentials: 'same-origin'});
 }
 
 // ── Navigation ──

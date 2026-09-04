@@ -3,6 +3,7 @@ services:
     build: .
     ports:
       - "8000:8000"
+    user: "1000:1000"       # run as non-root
     volumes:
       - crm-data:/app/data
     env_file:

@@ -98,9 +98,9 @@ def test_no_secret_in_index_html():
 def test_session_cookie_is_signed_and_expiry_valid():
     from app import create_session_token, verify_session_token
     tok = create_session_token()
-    assert verify_session_token(tok) is True
+    assert verify_session_token(tok) is not None  # returns user_id (int) if valid
     # Tampered token rejected
-    assert verify_session_token(tok[:-3] + "abc") is False
+    assert verify_session_token(tok[:-3] + "abc") is None  # tampered → None
 
 
 # ── Contacts CRUD ─────────────────────────────────────────────────────────
@@ -204,3 +204,55 @@ def test_stats_counts():
     assert s["total_contacts"] == 3
     assert s["by_status"]["customer"] == 2
     assert s["won_value"] == 100
+
+
+# ── Multi-user & roles ────────────────────────────────────────────────────
+def test_users_table_seeded_admin():
+    import app as crm_app
+    with crm_app.get_db() as db:
+        row = db.execute("SELECT username, role FROM users WHERE username='testadmin'").fetchone()
+        assert row is not None
+        assert row["role"] == "admin"
+
+
+def test_admin_can_create_member_user():
+    _login_headers()
+    r = client.post("/api/users", json={"username": "sara", "password": "strongpass123", "role": "member"})
+    assert r.status_code == 200
+    u = client.get("/api/users").json()["users"]
+    assert any(x["username"] == "sara" and x["role"] == "member" for x in u)
+
+
+def test_member_cannot_access_admin_apis():
+    _login_headers()
+    client.post("/api/users", json={"username": "member1", "password": "strongpass123", "role": "member"})
+    client.post("/logout")
+    # Login as member
+    m = client.post("/login", data={"username": "member1", "password": "strongpass123"}, follow_redirects=False)
+    assert m.status_code == 302
+    r = client.get("/api/users")
+    assert r.status_code == 403  # member cannot list users
+    # member can still use normal APIs
+    r2 = client.get("/api/contacts")
+    assert r2.status_code == 200
+
+
+def test_duplicate_username_409():
+    _login_headers()
+    client.post("/api/users", json={"username": "dup", "password": "strongpass123", "role": "member"})
+    r = client.post("/api/users", json={"username": "dup", "password": "anotherpass123", "role": "member"})
+    assert r.status_code == 409
+
+
+# ── Rate limiting ─────────────────────────────────────────────────────────
+def test_login_rate_limit_blocks_after_5():
+    # Clear attempts
+    import app as crm_app
+    crm_app._login_attempts.clear()
+    client.cookies.clear()
+    for _ in range(5):
+        r = client.post("/login", data={"username": "admin", "password": "wrongpass"}, follow_redirects=False)
+        assert r.status_code == 401
+    # 6th attempt now rate-limited
+    r = client.post("/login", data={"username": "admin", "password": "wrongpass"}, follow_redirects=False)
+    assert r.status_code == 429

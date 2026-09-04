@@ -255,9 +255,9 @@ async function loadDashboard(){
   `;
 }
 
-function showAuthError(){
+function showAuthError() {
   const grid = document.getElementById('stats-grid');
-  grid.innerHTML = '<div class="card"><h2 style="color:var(--red)">❌ Unauthorized</h2><p>Set CRM_API_TOKEN env var to match the server token.</p></div>';
+  grid.innerHTML = '<div class="card"><h2 style="color:var(--red)">❌ Session Expired</h2><p>Your session has expired — please log in again.</p></div>';
 }
 
 // ── Contacts ──

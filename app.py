@@ -27,8 +27,8 @@ from typing import Optional, List, Dict, Any
 # ── Config (from env — never hardcoded) ───────────────────────────────────
 DB_PATH = os.environ.get("CRM_DB", "crm.db")
 ADMIN_USER = os.environ.get("CRM_ADMIN_USER", "admin")
-# If no password set, generate one at startup and PRINT it to stdout once.
 ADMIN_PASSWORD = os.environ.get("CRM_ADMIN_PASSWORD") or secrets.token_urlsafe(12)
+ADMIN_ROLE = "admin"
 if not os.environ.get("CRM_ADMIN_PASSWORD"):
     print(f"⚠️  CRM_ADMIN_PASSWORD not set — generated admin password: {ADMIN_PASSWORD}")
     print(f"    Set CRM_ADMIN_PASSWORD in docker-compose/env for persistence.")
@@ -45,33 +45,56 @@ SESSION_COOKIE = "crm_session"
 def _sign(msg: str, secret: str) -> str:
     return hmac.new(secret.encode(), msg.encode(), hashlib.sha256).hexdigest()
 
-def create_session_token() -> str:
+def create_session_token(user_id: int = None) -> str:
     expires = int(time.time()) + SESSION_TTL
-    payload = str(expires)
+    uid = user_id if user_id is not None else 0
+    payload = f"{expires}.{uid}"
     return f"{payload}.{_sign(payload, SESSION_SECRET)}"
 
-def verify_session_token(token: str) -> bool:
+def verify_session_token(token: str) -> Optional[int]:
+    """Return user_id if valid, None otherwise."""
     try:
-        payload, sig = token.rsplit(".", 1)
+        parts = token.rsplit(".", 1)
+        if len(parts) != 2:
+            return None
+        payload, sig = parts
         if not hmac.compare_digest(_sign(payload, SESSION_SECRET), sig):
-            return False
-        if int(payload) < time.time():
-            return False
-        return True
+            return None
+        exp_s, uid_s = payload.rsplit(".", 1)
+        if int(exp_s) < time.time():
+            return None
+        return int(uid_s)
     except Exception:
-        return False
+        return None
 
-async def require_auth(request: Request):
-    """Accept session cookie OR optional Bearer token for API clients."""
+def _user_by_id(uid: int):
+    with get_db() as db:
+        return db.execute("SELECT id, username, role FROM users WHERE id=?", (uid,)).fetchone()
+
+def _user_by_username(username: str):
+    with get_db() as db:
+        return db.execute("SELECT id, username, password_hash, role FROM users WHERE username=?", (username,)).fetchone()
+
+async def require_auth(request: Request) -> dict:
+    """Accept session cookie OR optional Bearer token. Returns user dict (or api-client pseudo-user)."""
     cookie = request.cookies.get(SESSION_COOKIE, "")
-    if cookie and verify_session_token(cookie):
-        return "session"
+    if cookie:
+        uid = verify_session_token(cookie)
+        if uid is not None:
+            user = _user_by_id(uid)
+            if user:
+                return {"id": user["id"], "username": user["username"], "role": user["role"], "method": "session"}
     auth = request.headers.get("Authorization", "")
     if API_TOKEN and auth.startswith("Bearer "):
         supplied = auth[7:]
         if hmac.compare_digest(supplied, API_TOKEN):
-            return "bearer"
+            return {"id": 0, "username": "api-client", "role": "admin", "method": "bearer"}
     raise HTTPException(status_code=401, detail="Authentication required")
+
+def require_admin(user: dict = Depends(require_auth)) -> dict:
+    if user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Admin privileges required")
+    return user
 
 # ── App ───────────────────────────────────────────────────────────────────
 app = FastAPI(title="CRM App", version="3.0.0", docs_url="/docs")
@@ -144,6 +167,25 @@ class ActivityCreate(BaseModel):
     body: Optional[str] = Field(default=None, max_length=1000)
     due_date: Optional[str] = Field(default=None, max_length=50)
 
+# ── Password hashing (stdlib, PBKDF2) ─────────────────────────────────────
+def hash_password(password: str, salt: str | None = None) -> str:
+    """PBKDF2-HMAC-SHA256 with per-user salt. Format: pbkdf2$iter$salt$hash"""
+    if salt is None:
+        salt = secrets.token_hex(16)
+    iterations = 260_000
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), iterations)
+    return f"pbkdf2${iterations}${salt}${dk.hex()}"
+
+def verify_password(password: str, stored: str) -> bool:
+    try:
+        algo, iter_s, salt, expected = stored.split("$")
+        if algo != "pbkdf2":
+            return False
+        dk = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), int(iter_s))
+        return hmac.compare_digest(dk.hex(), expected)
+    except Exception:
+        return False
+
 # ── Database ──────────────────────────────────────────────────────────────
 @contextmanager
 def get_db():
@@ -160,6 +202,13 @@ def get_db():
 def init_db():
     with get_db() as db:
         db.executescript("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'member' CHECK(role IN ('admin','member')),
+            created_at TEXT DEFAULT (datetime('now'))
+        );
         CREATE TABLE IF NOT EXISTS contacts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             first_name TEXT NOT NULL,
@@ -208,27 +257,63 @@ def init_db():
 
 init_db()
 
+def seed_admin():
+    """Insert the env-configured admin if not present."""
+    with get_db() as db:
+        exists = db.execute("SELECT id FROM users WHERE username=?", (ADMIN_USER,)).fetchone()
+        if not exists:
+            db.execute(
+                "INSERT INTO users (username, password_hash, role) VALUES (?,?,?)",
+                (ADMIN_USER, hash_password(ADMIN_PASSWORD), ADMIN_ROLE),
+            )
+            print(f"✅ Seeded admin user: {ADMIN_USER} (role=admin)")
+
+seed_admin()
+
+# ── Login rate limiting (in-memory, per-IP) ──────────────────────────────
+LOGIN_MAX_ATTEMPTS = 5
+LOGIN_WINDOW = 15 * 60  # 15 minutes
+_login_attempts: Dict[str, list] = {}  # ip -> [timestamps]
+
+def _check_login_rate_limit(ip: str):
+    now = time.time()
+    attempts = [t for t in _login_attempts.get(ip, []) if now - t < LOGIN_WINDOW]
+    _login_attempts[ip] = attempts
+    if len(attempts) >= LOGIN_MAX_ATTEMPTS:
+        wait = int(LOGIN_WINDOW - (now - attempts[0]))
+        raise HTTPException(status_code=429, detail=f"Too many attempts. Try again in {max(1, wait // 60)} min.")
+    _login_attempts[ip].append(now)
+    return True
+
+def _login_ip(request: Request) -> str:
+    fwd = request.headers.get("x-forwarded-for")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
 # ── Auth routes ───────────────────────────────────────────────────────────
 @app.get("/login", response_class=HTMLResponse)
 async def login_page(request: Request):
     # Already authed? bounce to /
-    if request.cookies.get(SESSION_COOKIE) and verify_session_token(request.cookies.get(SESSION_COOKIE, "")):
+    if request.cookies.get(SESSION_COOKIE) and verify_session_token(request.cookies.get(SESSION_COOKIE, "")) is not None:
         return RedirectResponse("/", status_code=302)
     return templates.TemplateResponse(request, "login.html", {})
 
 @app.post("/login")
 async def login_submit(
+    request: Request,
     username: str = Form(...),
     password: str = Form(...),
 ):
-    user_ok = hmac.compare_digest(username, ADMIN_USER)
-    pass_ok = hmac.compare_digest(password, ADMIN_PASSWORD)
-    if not (user_ok and pass_ok):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+    user = _user_by_username(username)
+    if not user or not verify_password(password, user["password_hash"]):
+        ip = _login_ip(request)
+        _check_login_rate_limit(ip)
+        raise HTTPException(status_code=401, detail="Invalid credentials or account locked")
     resp = RedirectResponse("/", status_code=302)
     resp.set_cookie(
         SESSION_COOKIE,
-        create_session_token(),
+        create_session_token(user_id=user["id"]),
         httponly=True,
         samesite="lax",
         max_age=SESSION_TTL,
@@ -246,12 +331,51 @@ async def logout():
 @app.get("/api/me")
 async def me(request: Request):
     cookie = request.cookies.get(SESSION_COOKIE, "")
-    if cookie and verify_session_token(cookie):
-        return {"authenticated": True, "user": ADMIN_USER, "method": "session"}
+    if cookie:
+        uid = verify_session_token(cookie)
+        if uid is not None:
+            user = _user_by_id(uid)
+            if user:
+                return {"authenticated": True, "user": user["username"], "role": user["role"], "method": "session"}
     auth = request.headers.get("Authorization", "")
     if API_TOKEN and auth.startswith("Bearer ") and hmac.compare_digest(auth[7:], API_TOKEN):
-        return {"authenticated": True, "user": "api-client", "method": "bearer"}
+        return {"authenticated": True, "user": "api-client", "role": "admin", "method": "bearer"}
     return JSONResponse({"authenticated": False}, status_code=401)
+
+# ── API: Users (admin only) ──────────────────────────────────────────────
+class UserCreate(BaseModel):
+    username: str = Field(..., min_length=3, max_length=50, pattern=r"^[a-zA-Z0-9_.-]+$")
+    password: str = Field(..., min_length=8, max_length=128)
+    role: str = Field(default="member", pattern=r"^(admin|member)$")
+
+@app.get("/api/users", dependencies=[Depends(require_admin)])
+async def list_users():
+    with get_db() as db:
+        rows = [dict(r) for r in db.execute("SELECT id, username, role, created_at FROM users ORDER BY id").fetchall()]
+        return {"users": rows}
+
+@app.post("/api/users", dependencies=[Depends(require_admin)])
+async def create_user(u: UserCreate):
+    with get_db() as db:
+        exists = db.execute("SELECT id FROM users WHERE username=?", (u.username,)).fetchone()
+        if exists:
+            raise HTTPException(409, "Username already exists")
+        cur = db.execute(
+            "INSERT INTO users (username, password_hash, role) VALUES (?,?,?)",
+            (u.username, hash_password(u.password), u.role),
+        )
+        return {"id": cur.lastrowid, "ok": True}
+
+@app.delete("/api/users/{uid}", dependencies=[Depends(require_admin)])
+async def delete_user(uid: int, auth: dict = Depends(require_auth)):
+    if uid == auth["id"]:
+        raise HTTPException(400, "Cannot delete your own account")
+    with get_db() as db:
+        row = db.execute("SELECT id FROM users WHERE id=?", (uid,)).fetchone()
+        if not row:
+            raise HTTPException(404, "User not found")
+        db.execute("DELETE FROM users WHERE id=?", (uid,))
+        return {"ok": True, "deleted_id": uid}
 
 # ── API: Contacts ─────────────────────────────────────────────────────────
 @app.get("/api/contacts")
@@ -451,7 +575,7 @@ async def get_stats(auth: str = Depends(require_auth)):
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     cookie = request.cookies.get(SESSION_COOKIE, "")
-    if not (cookie and verify_session_token(cookie)):
+    if not (cookie and verify_session_token(cookie) is not None):
         return RedirectResponse("/login", status_code=302)
     return templates.TemplateResponse(request, "index.html", {})
 

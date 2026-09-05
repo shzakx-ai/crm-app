@@ -45,8 +45,21 @@ def _ensure_migrations_table(conn):
 
 
 def migrate_db():
-    """Apply pending migrations in order. Safe to call repeatedly."""
-    with get_db() as conn:
+    """Apply pending migrations in order. Safe to call repeatedly.
+
+    Opens its own connection with `PRAGMA foreign_keys=OFF` set *before* any
+    transaction begins. This is essential: migrations rebuild tables
+    (create-new -> copy -> drop). With foreign_keys on, SQLite would run
+    an implicit DELETE on DROP TABLE and fire ON DELETE CASCADE against
+    child rows (deals/activities) — silently destroying data during an
+    upgrade. PRAGMA foreign_keys is ignored inside a transaction, so it
+    must be toggled before the first DML statement.
+    """
+    conn = sqlite3.connect(get_db_path())
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=OFF")   # <-- critical: before any DML
         _ensure_migrations_table(conn)
         applied = _applied_versions(conn)
         for name in MIGRATIONS:
@@ -57,6 +70,8 @@ def migrate_db():
             conn.execute("INSERT INTO schema_migrations (version) VALUES (?)", (name,))
             print(f"🧬 Migration applied: {name}")
         conn.commit()
+    finally:
+        conn.close()
 
 
 def init_db():

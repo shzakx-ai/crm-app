@@ -341,7 +341,7 @@ def test_migrate_legacy_db_adds_owner_column():
             company TEXT, phone TEXT, status TEXT DEFAULT 'new',
             created_at TEXT, updated_at TEXT
         );
-        INSERT INTO contacts (first_name, last_name) VALUES ('Old', 'Contact');
+        INSERT INTO contacts (id, first_name, last_name) VALUES (1, 'Old', 'Contact');
         CREATE TABLE deals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             contact_id INTEGER, title TEXT, value REAL,
@@ -354,6 +354,9 @@ def test_migrate_legacy_db_adds_owner_column():
             subject TEXT, body TEXT, done INTEGER DEFAULT 0, due_date TEXT,
             created_at TEXT
         );
+        -- Linked child rows that MUST survive the contacts rebuild (FK-cascade guard)
+        INSERT INTO deals (id, contact_id, title) VALUES (10, 1, 'LegacyDeal');
+        INSERT INTO activities (id, contact_id, subject) VALUES (20, 1, 'LegacyNote');
     """)
     conn.commit(); conn.close()
 
@@ -366,8 +369,14 @@ def test_migrate_legacy_db_adds_owner_column():
         cols = {r[1] for r in conn.execute("PRAGMA table_info(contacts)").fetchall()}
         assert "owner_id" in cols
         # Backfilled owner = legacy admin id (id 1)
-        owner = conn.execute("SELECT owner_id FROM contacts LIMIT 1").fetchone()[0]
+        owner = conn.execute("SELECT owner_id FROM contacts WHERE id=1").fetchone()[0]
         assert owner == 1
+        # The rebuild must NOT cascade-delete child rows (foreign_keys=OFF before DROP)
+        assert conn.execute("SELECT COUNT(*) FROM deals").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM activities").fetchone()[0] == 1
+        # And the linked deal/activity survive against contact 1
+        assert conn.execute("SELECT contact_id FROM deals WHERE id=10").fetchone()[0] == 1
+        assert conn.execute("SELECT contact_id FROM activities WHERE id=20").fetchone()[0] == 1
         conn.close()
     finally:
         os.environ["CRM_DB"] = on
@@ -513,5 +522,151 @@ def test_legacy_upgrade_has_owner_fk():
         owner = conn.execute("SELECT owner_id FROM contacts WHERE first_name='Legacy'").fetchone()[0]
         conn.close()
         assert owner == 1
+    finally:
+        os.environ["CRM_DB"] = on
+
+
+def test_migrate_rebuild_does_not_cascade_delete_linked_rows():
+    """Regression guard for the critical FK bug.
+
+    The migration runner must disable foreign_keys BEFORE any transaction
+    starts. Otherwise `DROP TABLE contacts` inside the table rebuild would
+    implicitly DELETE contacts and cascade-delete linked deals/activities,
+    silently destroying user data during a legacy upgrade.
+    """
+    import sqlite3
+    legacy = Path(tempfile.mkdtemp()) / "legacy_cascade.db"
+    conn = sqlite3.connect(legacy)
+    conn.executescript("""
+        CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE, password_hash TEXT, role TEXT DEFAULT 'member', created_at TEXT);
+        INSERT INTO users (username, password_hash, role) VALUES ('oldadmin','x','admin');
+        CREATE TABLE contacts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, first_name TEXT NOT NULL,
+            last_name TEXT NOT NULL DEFAULT '', email TEXT DEFAULT '', phone TEXT DEFAULT '',
+            company TEXT DEFAULT '', position TEXT DEFAULT '', status TEXT DEFAULT 'lead',
+            source TEXT DEFAULT '', notes TEXT DEFAULT '', created_at TEXT, updated_at TEXT
+        );
+        CREATE TABLE deals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            contact_id INTEGER REFERENCES contacts(id) ON DELETE CASCADE,
+            title TEXT, value REAL, created_at TEXT, updated_at TEXT
+        );
+        CREATE TABLE activities (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            contact_id INTEGER REFERENCES contacts(id) ON DELETE CASCADE,
+            subject TEXT, created_at TEXT
+        );
+        INSERT INTO contacts (id, first_name) VALUES (1, 'Linked');
+        INSERT INTO deals (id, contact_id, title) VALUES (5, 1, 'KeepDeal');
+        INSERT INTO activities (id, contact_id, subject) VALUES (6, 1, 'KeepActivity');
+    """)
+    conn.commit(); conn.close()
+    on = os.environ.get("CRM_DB")
+    try:
+        os.environ["CRM_DB"] = str(legacy)
+        crm_db.migrate_db()
+        conn = sqlite3.connect(legacy)
+        # The linked rows must survive the contacts rebuild.
+        assert conn.execute("SELECT COUNT(*) FROM deals").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM activities").fetchone()[0] == 1
+        conn.close()
+    finally:
+        os.environ["CRM_DB"] = on
+
+
+def test_migrate_preserves_extra_legacy_columns():
+    """A legacy DB with custom extra columns must survive the rebuild, values
+    intact and in their correct columns (column-order regression guard)."""
+    import sqlite3
+    legacy = Path(tempfile.mkdtemp()) / "legacy_extra.db"
+    conn = sqlite3.connect(legacy)
+    conn.executescript("""
+        CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE, password_hash TEXT, role TEXT DEFAULT 'member', created_at TEXT);
+        INSERT INTO users (username, password_hash, role) VALUES ('oldadmin','x','admin');
+        CREATE TABLE contacts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            custom_extra TEXT DEFAULT 'hello',
+            vip INTEGER DEFAULT 0,
+            first_name TEXT NOT NULL,
+            status TEXT DEFAULT 'lead'
+        );
+        INSERT INTO contacts (first_name, custom_extra, vip) VALUES ('HasExtra','kept',7);
+    """)
+    conn.commit(); conn.close()
+    on = os.environ.get("CRM_DB")
+    try:
+        os.environ["CRM_DB"] = str(legacy)
+        crm_db.migrate_db()
+        conn = sqlite3.connect(legacy)
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(contacts)").fetchall()]
+        # Extra columns were carried over
+        assert "custom_extra" in cols
+        assert "vip" in cols
+        row = conn.execute("SELECT * FROM contacts").fetchone()
+        ridx = {c: i for i, c in enumerate(cols)}
+        # The first_name value lands in first_name (not shifted a column over)
+        assert row[ridx["first_name"]] == "HasExtra"
+        assert row[ridx["custom_extra"]] == "kept"
+        assert row[ridx["vip"]] == 7
+        conn.close()
+    finally:
+        os.environ["CRM_DB"] = on
+
+
+def test_migrate_rebuilt_contacts_have_status_check():
+    """The rebuilt contacts table must carry a CHECK on status, so invalid
+    values are rejected at the DB layer — not only by Pydantic."""
+    import sqlite3
+    legacy = Path(tempfile.mkdtemp()) / "legacy_check.db"
+    conn = sqlite3.connect(legacy)
+    conn.executescript("""
+        CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE, password_hash TEXT, role TEXT DEFAULT 'member', created_at TEXT);
+        INSERT INTO users (username, password_hash, role) VALUES ('oldadmin','x','admin');
+        CREATE TABLE contacts (id INTEGER PRIMARY KEY AUTOINCREMENT, first_name TEXT NOT NULL, status TEXT DEFAULT 'lead');
+        INSERT INTO contacts (first_name, status) VALUES ('Ok','lead');
+    """)
+    conn.commit(); conn.close()
+    on = os.environ.get("CRM_DB")
+    try:
+        os.environ["CRM_DB"] = str(legacy)
+        crm_db.migrate_db()
+        conn = sqlite3.connect(legacy)
+        # An invalid status must be refused at the DB level after the rebuild
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("INSERT INTO contacts (first_name, status) VALUES ('Bad','gibberish')")
+        # Valid values still pass
+        conn.execute("INSERT INTO contacts (first_name, status) VALUES ('Good','prospect')")
+        conn.commit()
+        conn.close()
+    finally:
+        os.environ["CRM_DB"] = on
+
+
+def test_migrate_missing_canonical_columns_get_defaults():
+    """A legacy DB that lacks canonical columns (only id/first_name) must get
+    DEFAULTs — not string literals of the column names. Regression guard for
+    the SELECT \"missing_col\" → literal bug in the rebuild copy."""
+    import sqlite3
+    legacy = Path(tempfile.mkdtemp()) / "legacy_min.db"
+    conn = sqlite3.connect(legacy)
+    conn.executescript("""
+        CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE, password_hash TEXT, role TEXT DEFAULT 'member', created_at TEXT);
+        INSERT INTO users (username, password_hash, role) VALUES ('oldadmin','x','admin');
+        CREATE TABLE contacts (id INTEGER PRIMARY KEY AUTOINCREMENT, first_name TEXT NOT NULL);
+        INSERT INTO contacts (first_name) VALUES ('Minimal');
+    """)
+    conn.commit(); conn.close()
+    on = os.environ.get("CRM_DB")
+    try:
+        os.environ["CRM_DB"] = str(legacy)
+        crm_db.migrate_db()
+        conn = sqlite3.connect(legacy)
+        row = conn.execute("SELECT first_name, last_name, email, owner_id FROM contacts").fetchone()
+        assert row[0] == "Minimal"
+        # Missing canonical columns must carry DEFAULTs, not column-name literals
+        assert row[1] == ""
+        assert row[2] == ""
+        assert row[3] == 1
+        conn.close()
     finally:
         os.environ["CRM_DB"] = on

@@ -22,3 +22,28 @@ jobs:
           CRM_DB: /tmp/ci-test.db
         run: |
           pytest tests/ -v
+
+  # Build the Docker image on every push so Dockerfile issues
+  # (e.g. wrong USER/ownership ordering) are caught in CI.
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Docker image
+        run: |
+          docker build -t crm-app:ci .
+      - name: Smoke test container (start + login page responds)
+        run: |
+          docker run -d --name crm-ci --rm -p 8080:8000 \
+            -e CRM_ADMIN_USER=admin \
+            -e CRM_ADMIN_PASSWORD=ci-test-password \
+            -e CRM_SESSION_SECRET=ci-test-secret \
+            crm-app:ci
+          # wait for boot + hit the login page
+          for i in $(seq 1 20); do
+            if curl -sf http://127.0.0.1:8080/login >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/login)
+          docker rm -f crm-ci >/dev/null 2>&1 || true
+          test "$code" = "200"

@@ -96,6 +96,16 @@ def require_admin(user: dict = Depends(require_auth)) -> dict:
         raise HTTPException(status_code=403, detail="Admin privileges required")
     return user
 
+def is_admin(user: dict) -> bool:
+    return user.get("role") == "admin"
+
+def _scoped(db, user: dict, table: str, extra: str = "") -> str:
+    """Return a SQL scope clause limiting rows to those owned by the user,
+    unless the user is admin. extra is appended after the scope."""
+    if is_admin(user):
+        return " " + extra if extra else ""
+    return f" AND {table}.owner_id=? {extra}" if extra else f" AND {table}.owner_id=?"
+
 # ── App ───────────────────────────────────────────────────────────────────
 app = FastAPI(title="CRM App", version="3.0.0", docs_url="/docs")
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -211,6 +221,7 @@ def init_db():
         );
         CREATE TABLE IF NOT EXISTS contacts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_id INTEGER NOT NULL DEFAULT 1,
             first_name TEXT NOT NULL,
             last_name TEXT NOT NULL DEFAULT '',
             email TEXT DEFAULT '',
@@ -221,7 +232,8 @@ def init_db():
             source TEXT DEFAULT '',
             notes TEXT DEFAULT '',
             created_at TEXT DEFAULT (datetime('now')),
-            updated_at TEXT DEFAULT (datetime('now'))
+            updated_at TEXT DEFAULT (datetime('now')),
+            FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE
         );
         CREATE TABLE IF NOT EXISTS deals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -270,26 +282,38 @@ def seed_admin():
 
 seed_admin()
 
-# ── Login rate limiting (in-memory, per-IP) ──────────────────────────────
+# ── Login rate limiting (per-IP + per-username, in-memory) ────────────────
 LOGIN_MAX_ATTEMPTS = 5
 LOGIN_WINDOW = 15 * 60  # 15 minutes
-_login_attempts: Dict[str, list] = {}  # ip -> [timestamps]
-
-def _check_login_rate_limit(ip: str):
-    now = time.time()
-    attempts = [t for t in _login_attempts.get(ip, []) if now - t < LOGIN_WINDOW]
-    _login_attempts[ip] = attempts
-    if len(attempts) >= LOGIN_MAX_ATTEMPTS:
-        wait = int(LOGIN_WINDOW - (now - attempts[0]))
-        raise HTTPException(status_code=429, detail=f"Too many attempts. Try again in {max(1, wait // 60)} min.")
-    _login_attempts[ip].append(now)
-    return True
+# Rate limiting keys are IP + username. Using direct client IP only —
+# X-Forwarded-For is NOT trusted unless behind a trusted proxy (env).
+_login_attempts: Dict[str, list] = {}  # key -> [timestamps]
 
 def _login_ip(request: Request) -> str:
-    fwd = request.headers.get("x-forwarded-for")
-    if fwd:
-        return fwd.split(",")[0].strip()
+    """Return the client IP. If TRUST_PROXY=1, honor X-Forwarded-For;
+    otherwise use the direct connection IP (unspoofable)."""
+    trust_proxy = os.environ.get("TRUST_PROXY", "").lower() in ("1", "true")
+    if trust_proxy:
+        fwd = request.headers.get("x-forwarded-for")
+        if fwd:
+            return fwd.split(",")[0].strip()
     return request.client.host if request.client else "unknown"
+
+def _check_login_rate_limit(ip: str, username: str = ""):
+    now = time.time()
+    # Allowed keys: per-IP and per-IP+username. Both count toward quota.
+    keys = [ip]
+    if username:
+        keys.append(f"{ip}:{username}")
+    for key in keys:
+        attempts = [t for t in _login_attempts.get(key, []) if now - t < LOGIN_WINDOW]
+        _login_attempts[key] = attempts
+        if len(attempts) >= LOGIN_MAX_ATTEMPTS:
+            wait = int(LOGIN_WINDOW - (now - attempts[0]))
+            raise HTTPException(status_code=429, detail=f"Too many attempts. Try again in {max(1, wait // 60)} min.")
+    for key in keys:
+        _login_attempts[key].append(now)
+    return True
 
 # ── Auth routes ───────────────────────────────────────────────────────────
 @app.get("/login", response_class=HTMLResponse)
@@ -308,7 +332,7 @@ async def login_submit(
     user = _user_by_username(username)
     if not user or not verify_password(password, user["password_hash"]):
         ip = _login_ip(request)
-        _check_login_rate_limit(ip)
+        _check_login_rate_limit(ip, username)
         raise HTTPException(status_code=401, detail="Invalid credentials or account locked")
     resp = RedirectResponse("/", status_code=302)
     resp.set_cookie(
@@ -384,11 +408,14 @@ async def list_contacts(
     status: str = "",
     limit: int = Query(100, ge=1, le=200),
     offset: int = Query(0, ge=0, le=10000),
-    auth: str = Depends(require_auth),
+    auth: dict = Depends(require_auth),
 ):
     with get_db() as db:
         q = "SELECT * FROM contacts WHERE 1=1"
         params = []
+        if not is_admin(auth):
+            q += " AND owner_id=?"
+            params.append(auth["id"])
         if search:
             q += " AND (first_name||' '||last_name LIKE ? OR email LIKE ? OR company LIKE ?)"
             s = f"%{search}%"
@@ -399,29 +426,39 @@ async def list_contacts(
         q += " ORDER BY updated_at DESC LIMIT ? OFFSET ?"
         params.extend([limit, offset])
         rows = [dict(r) for r in db.execute(q, params).fetchall()]
-        total = db.execute("SELECT COUNT(*) FROM contacts").fetchone()[0]
+        total_q = "SELECT COUNT(*) FROM contacts WHERE 1=1"
+        total_params = []
+        if not is_admin(auth):
+            total_q += " AND owner_id=?"
+            total_params.append(auth["id"])
+        total = db.execute(total_q, total_params).fetchone()[0]
         return {"contacts": rows, "total": total}
 
 @app.post("/api/contacts")
 async def create_contact(
     c: ContactCreate,
-    auth: str = Depends(require_auth),
+    auth: dict = Depends(require_auth),
 ):
     with get_db() as db:
         cur = db.execute(
-            """INSERT INTO contacts (first_name,last_name,email,phone,company,position,status,source,notes)
-               VALUES (?,?,?,?,?,?,?,?,?)""",
-            (c.first_name, c.last_name, c.email, c.phone, c.company, c.position, c.status, c.source, c.notes),
+            """INSERT INTO contacts (owner_id,first_name,last_name,email,phone,company,position,status,source,notes)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (auth["id"], c.first_name, c.last_name, c.email, c.phone, c.company, c.position, c.status, c.source, c.notes),
         )
         return {"id": cur.lastrowid, "ok": True}
 
 @app.get("/api/contacts/{cid}")
 async def get_contact(
     cid: int,
-    auth: str = Depends(require_auth),
+    auth: dict = Depends(require_auth),
 ):
     with get_db() as db:
-        row = db.execute("SELECT * FROM contacts WHERE id=?", (cid,)).fetchone()
+        q = "SELECT * FROM contacts WHERE id=?"
+        params = [cid]
+        if not is_admin(auth):
+            q += " AND owner_id=?"
+            params.append(auth["id"])
+        row = db.execute(q, params).fetchone()
         if not row:
             raise HTTPException(404, "Contact not found")
         deals = [dict(r) for r in db.execute("SELECT * FROM deals WHERE contact_id=? ORDER BY created_at DESC", (cid,)).fetchall()]
@@ -432,10 +469,15 @@ async def get_contact(
 async def update_contact(
     cid: int,
     c: ContactUpdate,
-    auth: str = Depends(require_auth),
+    auth: dict = Depends(require_auth),
 ):
     with get_db() as db:
-        row = db.execute("SELECT id FROM contacts WHERE id=?", (cid,)).fetchone()
+        q = "SELECT id FROM contacts WHERE id=?"
+        params = [cid]
+        if not is_admin(auth):
+            q += " AND owner_id=?"
+            params.append(auth["id"])
+        row = db.execute(q, params).fetchone()
         if not row:
             raise HTTPException(404, "Contact not found")
         data = c.model_dump(exclude_unset=True)
@@ -450,10 +492,15 @@ async def update_contact(
 @app.delete("/api/contacts/{cid}")
 async def delete_contact(
     cid: int,
-    auth: str = Depends(require_auth),
+    auth: dict = Depends(require_auth),
 ):
     with get_db() as db:
-        row = db.execute("SELECT id FROM contacts WHERE id=?", (cid,)).fetchone()
+        q = "SELECT id FROM contacts WHERE id=?"
+        params = [cid]
+        if not is_admin(auth):
+            q += " AND owner_id=?"
+            params.append(auth["id"])
+        row = db.execute(q, params).fetchone()
         if not row:
             raise HTTPException(404, "Contact not found")
         db.execute("DELETE FROM contacts WHERE id=?", (cid,))
@@ -464,12 +511,15 @@ async def delete_contact(
 async def list_deals(
     stage: str = "",
     limit: int = Query(100, ge=1, le=200),
-    auth: str = Depends(require_auth),
+    auth: dict = Depends(require_auth),
 ):
     with get_db() as db:
         q = """SELECT d.*, c.first_name||' '||c.last_name as contact_name
                FROM deals d JOIN contacts c ON d.contact_id=c.id WHERE 1=1"""
         params = []
+        if not is_admin(auth):
+            q += " AND c.owner_id=?"
+            params.append(auth["id"])
         if stage:
             q += " AND d.stage=?"
             params.append(stage)
@@ -480,10 +530,15 @@ async def list_deals(
 @app.post("/api/deals")
 async def create_deal(
     d: DealCreate,
-    auth: str = Depends(require_auth),
+    auth: dict = Depends(require_auth),
 ):
     with get_db() as db:
-        contact = db.execute("SELECT id FROM contacts WHERE id=?", (d.contact_id,)).fetchone()
+        q = "SELECT id FROM contacts WHERE id=?"
+        params = [d.contact_id]
+        if not is_admin(auth):
+            q += " AND owner_id=?"
+            params.append(auth["id"])
+        contact = db.execute(q, params).fetchone()
         if not contact:
             raise HTTPException(404, "Contact not found")
         cur = db.execute(
@@ -496,10 +551,15 @@ async def create_deal(
 async def update_deal(
     did: int,
     d: DealUpdate,
-    auth: str = Depends(require_auth),
+    auth: dict = Depends(require_auth),
 ):
     with get_db() as db:
-        drow = db.execute("SELECT id FROM deals WHERE id=?", (did,)).fetchone()
+        q = """SELECT d.id FROM deals d JOIN contacts c ON d.contact_id=c.id WHERE d.id=?"""
+        params = [did]
+        if not is_admin(auth):
+            q += " AND c.owner_id=?"
+            params.append(auth["id"])
+        drow = db.execute(q, params).fetchone()
         if not drow:
             raise HTTPException(404, "Deal not found")
         data = d.model_dump(exclude_unset=True)
@@ -513,10 +573,15 @@ async def update_deal(
 @app.delete("/api/deals/{did}")
 async def delete_deal(
     did: int,
-    auth: str = Depends(require_auth),
+    auth: dict = Depends(require_auth),
 ):
     with get_db() as db:
-        drow = db.execute("SELECT id FROM deals WHERE id=?", (did,)).fetchone()
+        q = """SELECT d.id FROM deals d JOIN contacts c ON d.contact_id=c.id WHERE d.id=?"""
+        params = [did]
+        if not is_admin(auth):
+            q += " AND c.owner_id=?"
+            params.append(auth["id"])
+        drow = db.execute(q, params).fetchone()
         if not drow:
             raise HTTPException(404, "Deal not found")
         db.execute("DELETE FROM deals WHERE id=?", (did,))
@@ -526,10 +591,15 @@ async def delete_deal(
 @app.post("/api/activities")
 async def create_activity(
     a: ActivityCreate,
-    auth: str = Depends(require_auth),
+    auth: dict = Depends(require_auth),
 ):
     with get_db() as db:
-        contact = db.execute("SELECT id FROM contacts WHERE id=?", (a.contact_id,)).fetchone()
+        q = "SELECT id FROM contacts WHERE id=?"
+        params = [a.contact_id]
+        if not is_admin(auth):
+            q += " AND owner_id=?"
+            params.append(auth["id"])
+        contact = db.execute(q, params).fetchone()
         if not contact:
             raise HTTPException(404, "Contact not found")
         cur = db.execute(
@@ -541,10 +611,15 @@ async def create_activity(
 @app.put("/api/activities/{aid}/done")
 async def mark_activity_done(
     aid: int,
-    auth: str = Depends(require_auth),
+    auth: dict = Depends(require_auth),
 ):
     with get_db() as db:
-        row = db.execute("SELECT id FROM activities WHERE id=?", (aid,)).fetchone()
+        q = """SELECT a.id FROM activities a JOIN contacts c ON a.contact_id=c.id WHERE a.id=?"""
+        params = [aid]
+        if not is_admin(auth):
+            q += " AND c.owner_id=?"
+            params.append(auth["id"])
+        row = db.execute(q, params).fetchone()
         if not row:
             raise HTTPException(404, "Activity not found")
         db.execute("UPDATE activities SET done=1 WHERE id=?", (aid,))
@@ -552,15 +627,33 @@ async def mark_activity_done(
 
 # ── API: Dashboard Stats ──────────────────────────────────────────────────
 @app.get("/api/stats")
-async def get_stats(auth: str = Depends(require_auth)):
+async def get_stats(auth: dict = Depends(require_auth)):
     with get_db() as db:
-        total = db.execute("SELECT COUNT(*) FROM contacts").fetchone()[0]
-        by_status = {r[0]: r[1] for r in db.execute("SELECT status, COUNT(*) FROM contacts GROUP BY status").fetchall()}
-        pipeline = {r[0]: r[1] for r in db.execute("SELECT stage, COUNT(*) FROM deals GROUP BY stage").fetchall()}
-        pipeline_value = {r[0]: r[1] for r in db.execute("SELECT stage, SUM(value) FROM deals GROUP BY stage").fetchall()}
-        won_value = db.execute("SELECT COALESCE(SUM(value),0) FROM deals WHERE stage='won'").fetchone()[0]
-        open_deals = db.execute("SELECT COUNT(*) FROM deals WHERE stage NOT IN ('won','lost')").fetchone()[0]
-        overdue = db.execute("SELECT COUNT(*) FROM activities WHERE done=0 AND due_date != '' AND due_date < date('now')").fetchone()[0]
+        admin = is_admin(auth)
+        # Scope for tables queried directly (contacts): owner_id column exists there
+        scope_c = "" if admin else " AND owner_id=?"
+        # Scope for joined queries where owner lives on contacts c
+        scope_d = "" if admin else " AND c.owner_id=?"
+        sp = [auth["id"]] if not admin else []
+
+        total = db.execute("SELECT COUNT(*) FROM contacts WHERE 1=1" + scope_c, sp).fetchone()[0]
+        by_status = {r[0]: r[1] for r in db.execute(
+            "SELECT status, COUNT(*) FROM contacts WHERE 1=1" + scope_c + " GROUP BY status", sp).fetchall()}
+        pipeline = {r[0]: r[1] for r in db.execute(
+            "SELECT d.stage, COUNT(*) FROM deals d JOIN contacts c ON d.contact_id=c.id WHERE 1=1" + scope_d + " GROUP BY d.stage",
+            sp).fetchall()}
+        pipeline_value = {r[0]: r[1] for r in db.execute(
+            "SELECT d.stage, SUM(d.value) FROM deals d JOIN contacts c ON d.contact_id=c.id WHERE 1=1" + scope_d + " GROUP BY d.stage",
+            sp).fetchall()}
+        won_value = db.execute(
+            "SELECT COALESCE(SUM(d.value),0) FROM deals d JOIN contacts c ON d.contact_id=c.id WHERE d.stage='won'" + scope_d,
+            sp).fetchone()[0]
+        open_deals = db.execute(
+            "SELECT COUNT(*) FROM deals d JOIN contacts c ON d.contact_id=c.id WHERE d.stage NOT IN ('won','lost')" + scope_d,
+            sp).fetchone()[0]
+        overdue = db.execute(
+            "SELECT COUNT(*) FROM activities a JOIN contacts c ON a.contact_id=c.id WHERE a.done=0 AND a.due_date != '' AND a.due_date < date('now')" + scope_d,
+            sp).fetchone()[0]
         return {
             "total_contacts": total,
             "by_status": by_status,

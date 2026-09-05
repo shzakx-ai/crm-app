@@ -55,7 +55,8 @@ python app.py
 - **Passwords hashed with PBKDF2-HMAC-SHA256** (260k iterations, per-user salt) — never stored in plaintext
 - **Multi-user roles:** `admin` (full access + user management) vs `member` (CRUD only).
   `require_admin` guards the user-management APIs (403 for members)
-- **Login rate limiting:** max 5 failed attempts per IP per 15 minutes → 429 with cooldown (mitigates brute-force)
+- **Login rate limiting:** max 5 failed attempts per IP **and per IP+username** per 15 minutes → 429 with cooldown
+- **Trusted-proxy only:** `X-Forwarded-For` is ignored unless `TRUST_PROXY=1` is set — the direct client IP is used by default (unspoofable)
 - Optional Bearer token for external API clients (set `CRM_API_TOKEN`) — grants admin-level API access
 - Pydantic validation on all inputs (email format, status enums, string lengths, username pattern, password ≥ 8)
 - `limit`/`offset` bounded (1–200 / 0–10000)
@@ -81,6 +82,17 @@ curl http://localhost:8000/api/users -H "Authorization: Bearer $CRM_API_TOKEN"
 # Delete a user (admin only; cannot delete yourself)
 curl -X DELETE http://localhost:8000/api/users/2 -H "Authorization: Bearer $CRM_API_TOKEN"
 ```
+
+## Data Ownership (row-level isolation)
+
+- Every contact carries an `owner_id` (the user who created it)
+- **Members see/edit/delete only their own records.** Trying to read, update, delete,
+  or attach a deal/activity to another user's contact returns **404** (not 403 — no existence leak)
+- **Admins see everything** (full cross-user visibility)
+- Dashboard `/api/stats` is scoped per user: members see only their own counts
+- Deleting a user cascades to their contacts (and their deals/activities via FK)
+- Note: this is team-level isolation, not hierarchical multi-tenant permissions —
+  admins deliberately have global visibility
 
 ## API Endpoints
 

@@ -1,6 +1,6 @@
 FROM python:3.12-slim
 
-# Create non-root user
+# Create non-root user FIRST (before any /app writes)
 RUN groupadd --gid 1000 crm && useradd --uid 1000 --gid crm --create-home crm
 
 WORKDIR /app
@@ -12,11 +12,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy app as non-root user
 COPY --chown=crm:crm . .
 
-# Switch to non-root user
-USER crm
+# Create writable data dir + fix ownership — BEFORE switching to crm
+# (root must do this: /app is owned by root at this point)
+RUN mkdir -p /app/data && chown -R crm:crm /app
 
-# Data dir must be writable by crm
-RUN mkdir -p /app/data && chown crm:crm /app/data
+# Switch to non-root user AFTER files are owned by crm
+USER crm
 
 EXPOSE 8000
 

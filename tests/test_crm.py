@@ -256,3 +256,61 @@ def test_login_rate_limit_blocks_after_5():
     # 6th attempt now rate-limited
     r = client.post("/login", data={"username": "admin", "password": "wrongpass"}, follow_redirects=False)
     assert r.status_code == 429
+
+
+# ── Ownership isolation (member can't see/modify admin data) ─────────────
+def _create_member(name):
+    _login_headers()
+    client.post("/api/users", json={"username": name, "password": "strongpass123", "role": "member"})
+    client.post("/logout")
+    m = client.post("/login", data={"username": name, "password": "strongpass123"}, follow_redirects=False)
+    assert m.status_code == 302
+
+
+def test_owner_isolation_contacts():
+    # Admin creates a contact
+    _login_headers()
+    r = client.post("/api/contacts", json={"first_name": "AdminContact"})
+    assert r.status_code == 200
+    admin_cid = r.json()["id"]
+    client.post("/logout")
+
+    # Member logs in — should NOT see admin's contact
+    _create_member("isomember")
+    contacts = client.get("/api/contacts").json()["contacts"]
+    assert all(c["id"] != admin_cid for c in contacts)
+    # Member cannot read it directly either
+    assert client.get(f"/api/contacts/{admin_cid}").status_code == 404
+    # Member cannot update/delete it
+    assert client.put(f"/api/contacts/{admin_cid}", json={"first_name": "Hacked"}).status_code == 404
+    assert client.delete(f"/api/contacts/{admin_cid}").status_code == 404
+
+
+def test_owner_gets_own_contacts():
+    _create_member("ownermember")
+    r = client.post("/api/contacts", json={"first_name": "Mine"})
+    assert r.status_code == 200
+    mine = r.json()["id"]
+    contacts = client.get("/api/contacts").json()["contacts"]
+    assert any(c["id"] == mine for c in contacts)
+    # Member can read/update/delete own contact
+    assert client.get(f"/api/contacts/{mine}").status_code == 200
+    assert client.put(f"/api/contacts/{mine}", json={"first_name": "Mine2"}).status_code == 200
+    assert client.delete(f"/api/contacts/{mine}").status_code == 200
+
+
+def test_owner_isolation_deals_and_stats():
+    # Admin contact + deal
+    _login_headers()
+    rc = client.post("/api/contacts", json={"first_name": "AdminDealOwner"}).json()
+    admin_cid = rc["id"]
+    client.post("/api/deals", json={"contact_id": admin_cid, "title": "AdminSecret", "value": 9999})
+    client.post("/logout")
+
+    # Member: count only own data in stats, cannot attach deal to admin contact
+    _create_member("dealmember")
+    assert client.get("/api/stats").json()["total_contacts"] == 0
+    r = client.post("/api/deals", json={"contact_id": admin_cid, "title": "Steal", "value": 1})
+    assert r.status_code == 404  # cannot create deal on someone else's contact
+    deals = client.get("/api/deals").json()["deals"]
+    assert all(d["title"] != "AdminSecret" for d in deals)

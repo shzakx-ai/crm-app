@@ -12,7 +12,7 @@ Lightweight multi-user Customer Relationship Management system built with FastAP
 - **Dark UI** — Clean, responsive Bloomberg-style interface
 - **🔐 Real Authentication** — Session-based login (HttpOnly cookie), no secrets in HTML
 - **🚦 Login Rate Limiting** — 5 attempts / 15 min per IP, 60s lockout
-- **✅ Tested** — 27 automated tests covering auth, validation, CRUD, security, roles, rate limiting
+- **✅ Tested** — 36 automated tests covering auth, validation, CRUD, security, roles, rate limiting, migrations, ownership isolation
 
 ## Quick Start
 
@@ -32,7 +32,7 @@ pip install -r requirements.txt
 export CRM_ADMIN_USER=admin
 export CRM_ADMIN_PASSWORD=your-password
 export CRM_SESSION_SECRET=random-secret
-python app.py
+uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
 ## Configuration (env vars)
@@ -90,7 +90,8 @@ curl -X DELETE http://localhost:8000/api/users/2 -H "Authorization: Bearer $CRM_
   or attach a deal/activity to another user's contact returns **404** (not 403 — no existence leak)
 - **Admins see everything** (full cross-user visibility)
 - Dashboard `/api/stats` is scoped per user: members see only their own counts
-- Deleting a user cascades to their contacts (and their deals/activities via FK)
+- **Deleting a user who owns contacts is refused (409)** — reassign or delete their
+  records first. No silent data loss via cascade.
 - Note: this is team-level isolation, not hierarchical multi-tenant permissions —
   admins deliberately have global visibility
 
@@ -121,6 +122,42 @@ All `/api/*` endpoints require either a valid session cookie or `Authorization: 
 | GET | `/api/stats` | Dashboard statistics |
 | GET | `/docs` | OpenAPI docs (Swagger) |
 
+## Project Structure
+
+```
+app/
+├── main.py            # App factory: wires config → migrations → seeding → routers
+├── config.py          # Env-driven configuration (CRM_*)
+├── db.py              # SQLite access + versioned migration runner
+├── auth.py            # Sessions, passwords, rate limiting, auth dependencies
+├── models.py          # Pydantic schemas (strict input validation)
+├── routers/           # API + frontend routes
+│   ├── auth.py        #   /login, /logout, /api/me
+│   ├── users.py       #   /api/users (admin only)
+│   ├── contacts.py    #   /api/contacts CRUD + ownership scoping
+│   ├── deals.py       #   /api/deals
+│   ├── activities.py  #   /api/activities
+│   ├── stats.py       #   /api/stats
+│   └── frontend.py    #   index page
+└── services/
+    └── ownership.py   # Row-level scoping helpers (shared by routers)
+
+migrations/            # Versioned schema migrations (applied in order)
+├── 001_init.py        # v1 schema: users, contacts, deals, activities
+├── 002_owner_id.py    # v2: add contacts.owner_id + safe indexes
+└── 003_api_bot.py     # v3: system api-bot user for Bearer clients
+```
+
+## Migrations
+
+Schema changes live in numbered files under `migrations/`, each exposing
+`migrate(conn)`. On startup, `app.db.migrate_db()` applies pending migrations
+**in order** and records them in a `schema_migrations` table — so the same
+database can be upgraded safely across versions (v1 → v2 → v3) without
+re-running already-applied steps. The runner is **idempotent**: a second boot
+is a no-op. Upgrading an existing v3.1 Docker volume automatically adds
+`contacts.owner_id` and back-fills legacy rows to the first admin.
+
 ## Tests
 
 ```bash
@@ -128,7 +165,7 @@ pip install -r requirements.txt
 pytest tests/ -v
 ```
 
-27 tests covering: auth redirects, HttpOnly cookie, wrong-password rejection, Bearer auth, secret non-leakage, contact validation, email validator on create + update, 404 handling, limit bounds, deal creation, stats, users/roles (admin vs member), duplicate username, login rate limiting.
+36 tests covering: auth redirects, HttpOnly cookie, wrong-password rejection, Bearer auth, secret non-leakage, contact validation, email validator on create + update, 404 handling, limit bounds, deal creation, stats, users/roles (admin vs member), duplicate username, login rate limiting, ownership isolation, legacy-DB migration, migration idempotency, Bearer FK-safe owner.
 
 ## CI
 

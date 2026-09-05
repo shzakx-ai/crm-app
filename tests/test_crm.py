@@ -17,9 +17,14 @@ os.environ["CRM_SESSION_SECRET"] = "test-secret-for-tests"
 os.environ["CRM_API_TOKEN"] = "test-bearer-token"
 
 from fastapi.testclient import TestClient
-import app as crm_app
+import app.main as crm_app_module
+from app.main import app
+from app import db as crm_db
+from app import auth as crm_auth
 
-client = TestClient(crm_app.app)
+client = TestClient(app)
+crm_app = crm_app_module  # alias (get_db forwarded below) so existing calls keep working
+crm_app.get_db = crm_db.get_db
 
 
 @pytest.fixture(autouse=True)
@@ -96,7 +101,7 @@ def test_no_secret_in_index_html():
 
 
 def test_session_cookie_is_signed_and_expiry_valid():
-    from app import create_session_token, verify_session_token
+    from app.auth import create_session_token, verify_session_token
     tok = create_session_token()
     assert verify_session_token(tok) is not None  # returns user_id (int) if valid
     # Tampered token rejected
@@ -208,7 +213,6 @@ def test_stats_counts():
 
 # ── Multi-user & roles ────────────────────────────────────────────────────
 def test_users_table_seeded_admin():
-    import app as crm_app
     with crm_app.get_db() as db:
         row = db.execute("SELECT username, role FROM users WHERE username='testadmin'").fetchone()
         assert row is not None
@@ -247,8 +251,7 @@ def test_duplicate_username_409():
 # ── Rate limiting ─────────────────────────────────────────────────────────
 def test_login_rate_limit_blocks_after_5():
     # Clear attempts
-    import app as crm_app
-    crm_app._login_attempts.clear()
+    crm_auth._login_attempts.clear()
     client.cookies.clear()
     for _ in range(5):
         r = client.post("/login", data={"username": "admin", "password": "wrongpass"}, follow_redirects=False)
@@ -318,9 +321,11 @@ def test_owner_isolation_deals_and_stats():
 
 # ── Migration: v3.1 DB without owner_id must upgrade safely ──────────────
 def test_migrate_legacy_db_adds_owner_column():
-    import sqlite3, importlib
+    import sqlite3
     # Build a legacy v3.1 database WITHOUT owner_id (file on disk, not env-swapped)
     legacy = Path(_tmp) / "legacy31.db"
+    if legacy.exists():
+        legacy.unlink()
     conn = sqlite3.connect(legacy)
     conn.executescript("""
         CREATE TABLE users (
@@ -336,14 +341,26 @@ def test_migrate_legacy_db_adds_owner_column():
             created_at TEXT, updated_at TEXT
         );
         INSERT INTO contacts (first_name, last_name) VALUES ('Old', 'Contact');
+        CREATE TABLE deals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            contact_id INTEGER, title TEXT, value REAL,
+            stage TEXT DEFAULT 'lead', expected_close TEXT, notes TEXT,
+            created_at TEXT, updated_at TEXT
+        );
+        CREATE TABLE activities (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            contact_id INTEGER, deal_id INTEGER, type TEXT DEFAULT 'note',
+            subject TEXT, body TEXT, done INTEGER DEFAULT 0, due_date TEXT,
+            created_at TEXT
+        );
     """)
     conn.commit(); conn.close()
 
-    # Point the app at the legacy DB, reload to run init+migrate
+    # Point the app at the legacy DB, run migrations directly (same versioning)
     on = os.environ.get("CRM_DB")
     try:
         os.environ["CRM_DB"] = str(legacy)
-        importlib.reload(crm_app)
+        crm_db.migrate_db()
         conn = sqlite3.connect(legacy)
         cols = {r[1] for r in conn.execute("PRAGMA table_info(contacts)").fetchall()}
         assert "owner_id" in cols
@@ -353,7 +370,39 @@ def test_migrate_legacy_db_adds_owner_column():
         conn.close()
     finally:
         os.environ["CRM_DB"] = on
-        importlib.reload(crm_app)
+
+
+def test_migrate_idempotent_second_run_noop():
+    """Running migrate_db twice on the same DB must not duplicate/break anything."""
+    import sqlite3
+    import os as _os
+    on = os.environ.get("CRM_DB")
+    db_file = str(Path(_tmp) / "legacy31.idem.db")
+    if _os.path.exists(db_file):
+        _os.remove(db_file)
+    try:
+        os.environ["CRM_DB"] = db_file
+        # Build legacy DB
+        conn = sqlite3.connect(os.environ["CRM_DB"])
+        conn.executescript("""
+            CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE, password_hash TEXT, role TEXT DEFAULT 'member', created_at TEXT);
+            INSERT INTO users (username, password_hash, role) VALUES ('idemadmin', 'x', 'admin');
+            CREATE TABLE contacts (id INTEGER PRIMARY KEY AUTOINCREMENT, first_name TEXT, last_name TEXT DEFAULT '', status TEXT DEFAULT 'lead', created_at TEXT, updated_at TEXT);
+            CREATE TABLE deals (id INTEGER PRIMARY KEY AUTOINCREMENT, contact_id INTEGER, title TEXT, value REAL, stage TEXT DEFAULT 'lead', expected_close TEXT, notes TEXT, created_at TEXT, updated_at TEXT);
+            CREATE TABLE activities (id INTEGER PRIMARY KEY AUTOINCREMENT, contact_id INTEGER, deal_id INTEGER, type TEXT DEFAULT 'note', subject TEXT, body TEXT, done INTEGER DEFAULT 0, due_date TEXT, created_at TEXT);
+            INSERT INTO contacts (first_name) VALUES ('Keep');
+        """)
+        conn.commit(); conn.close()
+        crm_db.migrate_db()
+        crm_db.migrate_db()  # second run must be a no-op
+        conn = sqlite3.connect(os.environ["CRM_DB"])
+        versions = [r[0] for r in conn.execute("SELECT version FROM schema_migrations").fetchall()]
+        assert versions == ["001_init", "002_owner_id", "003_api_bot"]
+        rows = conn.execute("SELECT COUNT(*) FROM contacts").fetchone()[0]
+        assert rows == 1
+        conn.close()
+    finally:
+        os.environ["CRM_DB"] = on
 
 
 # ── Bearer API client creates contacts with valid owner (FK-safe) ────────

@@ -9,7 +9,8 @@ from fastapi import HTTPException
 
 def contact_scope(user: dict, alias: str = "") -> tuple[str, list]:
     """WHERE fragment (+ params) restricting contacts to the current user.
-    alias: optional table alias, e.g. 'c' for JOINed queries."""
+    alias: optional table alias (e.g. 'c') for JOINed queries.
+    Returns ("", []) for admins (no restriction)."""
     prefix = f"{alias}." if alias else ""
     if user.get("role") == "admin":
         return "", []
@@ -17,13 +18,19 @@ def contact_scope(user: dict, alias: str = "") -> tuple[str, list]:
 
 
 def assert_owned_contact(db, user: dict, contact_id: int, alias: str = "") -> None:
-    """Raise 404 unless the contact exists AND is visible to the user."""
-    prefix = f"{alias}." if alias else ""
-    q = f"SELECT id FROM contacts WHERE id=?"
+    """Raise 404 unless the contact exists AND is visible to the user.
+
+    alias is a table alias used in an *outer* FROM/JOIN — the query is built
+    to reference the contacts table by that alias if provided, so aliased
+    queries (e.g. `FROM contacts c`) work the same as unaliased ones.
+    """
+    table = f"contacts {alias}" if alias else "contacts"
+    q = f"SELECT id FROM {table} WHERE id=?"
     params: list = [contact_id]
-    if user.get("role") != "admin":
-        q += f" AND {prefix}owner_id=?"
-        params.append(user["id"])
+    scope, sp = contact_scope(user, alias)
+    if scope:
+        q += f" AND {scope}"
+        params.extend(sp)
     row = db.execute(q, params).fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="Contact not found")

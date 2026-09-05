@@ -17,6 +17,7 @@ os.environ["CRM_SESSION_SECRET"] = "test-secret-for-tests"
 os.environ["CRM_API_TOKEN"] = "test-bearer-token"
 
 from fastapi.testclient import TestClient
+from fastapi import HTTPException
 import app.main as crm_app_module
 from app.main import app
 from app import db as crm_db
@@ -463,3 +464,54 @@ def test_total_respects_filters():
     assert r.json()["total"] == 1
     r = client.get("/api/contacts?status=lead&search=anna")
     assert r.json()["total"] == 0
+
+
+# ── assert_owned_contact works with an alias (latent bug guard) ───────────
+def test_owned_scope_with_alias():
+    from app.services.ownership import assert_owned_contact
+    _login_headers()
+    r = client.post("/api/contacts", json={"first_name": "Aliased"})
+    cid = r.json()["id"]
+    with crm_app.get_db() as db:
+        # admin passes, member without scope would 404; alias must not break SQL
+        admin = db.execute("SELECT id FROM users WHERE role='admin' LIMIT 1").fetchone()
+        user = dict(admin)
+        user["role"] = "admin"
+        assert_owned_contact(db, user, cid, alias="c")  # must not raise
+        member = {"id": admin["id"] + 999, "role": "member"}
+        try:
+            assert_owned_contact(db, member, cid, alias="c")
+            assert False, "member with wrong owner should raise"
+        except HTTPException as e:
+            assert e.status_code == 404
+
+
+# ── legacy upgrade produces an FK constraint identical to fresh ───────────
+def test_legacy_upgrade_has_owner_fk():
+    import sqlite3
+    legacy = Path(tempfile.mkdtemp()) / "legacy_fk.db"
+    conn = sqlite3.connect(legacy)
+    conn.executescript("""
+        CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE, password_hash TEXT, role TEXT DEFAULT 'member', created_at TEXT);
+        INSERT INTO users (username, password_hash, role) VALUES ('oldadmin','x','admin');
+        CREATE TABLE contacts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, first_name TEXT NOT NULL,
+            last_name TEXT NOT NULL DEFAULT '', email TEXT DEFAULT '', phone TEXT DEFAULT '',
+            company TEXT DEFAULT '', position TEXT DEFAULT '', status TEXT DEFAULT 'lead',
+            source TEXT DEFAULT '', notes TEXT DEFAULT '', created_at TEXT, updated_at TEXT
+        );
+        INSERT INTO contacts (first_name) VALUES ('Legacy');
+    """)
+    conn.commit(); conn.close()
+    on = os.environ.get("CRM_DB")
+    try:
+        os.environ["CRM_DB"] = str(legacy)
+        crm_db.migrate_db()
+        conn = sqlite3.connect(legacy)
+        fks = conn.execute("PRAGMA foreign_key_list(contacts)").fetchall()
+        assert any(row[2] == "users" and row[3] == "owner_id" for row in fks), fks
+        owner = conn.execute("SELECT owner_id FROM contacts WHERE first_name='Legacy'").fetchone()[0]
+        conn.close()
+        assert owner == 1
+    finally:
+        os.environ["CRM_DB"] = on

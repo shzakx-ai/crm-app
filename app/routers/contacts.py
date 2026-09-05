@@ -1,7 +1,7 @@
 """Contact CRUD with row-level ownership scoping."""
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from ..auth import is_admin, require_auth
+from ..auth import require_auth
 from ..db import get_db
 from ..models import ContactCreate, ContactUpdate
 from ..services.ownership import assert_owned_contact, contact_scope
@@ -59,14 +59,8 @@ async def create_contact(
 @router.get("/{cid}")
 async def get_contact(cid: int, auth: dict = Depends(require_auth)):
     with get_db() as conn:
-        q = "SELECT * FROM contacts WHERE id=?"
-        params: list = [cid]
-        if not is_admin(auth):
-            q += " AND owner_id=?"
-            params.append(auth["id"])
-        row = conn.execute(q, params).fetchone()
-        if not row:
-            raise HTTPException(404, "Contact not found")
+        assert_owned_contact(conn, auth, cid)
+        row = conn.execute("SELECT * FROM contacts WHERE id=?", (cid,)).fetchone()
         deals = [dict(r) for r in conn.execute(
             "SELECT * FROM deals WHERE contact_id=? ORDER BY created_at DESC", (cid,)
         ).fetchall()]
@@ -79,14 +73,7 @@ async def get_contact(cid: int, auth: dict = Depends(require_auth)):
 @router.put("/{cid}")
 async def update_contact(cid: int, c: ContactUpdate, auth: dict = Depends(require_auth)):
     with get_db() as conn:
-        q = "SELECT id FROM contacts WHERE id=?"
-        params: list = [cid]
-        if not is_admin(auth):
-            q += " AND owner_id=?"
-            params.append(auth["id"])
-        row = conn.execute(q, params).fetchone()
-        if not row:
-            raise HTTPException(404, "Contact not found")
+        assert_owned_contact(conn, auth, cid)
         data = c.model_dump(exclude_unset=True)
         if not data:
             raise HTTPException(400, "No fields to update")
@@ -102,13 +89,6 @@ async def update_contact(cid: int, c: ContactUpdate, auth: dict = Depends(requir
 @router.delete("/{cid}")
 async def delete_contact(cid: int, auth: dict = Depends(require_auth)):
     with get_db() as conn:
-        q = "SELECT id FROM contacts WHERE id=?"
-        params: list = [cid]
-        if not is_admin(auth):
-            q += " AND owner_id=?"
-            params.append(auth["id"])
-        row = conn.execute(q, params).fetchone()
-        if not row:
-            raise HTTPException(404, "Contact not found")
+        assert_owned_contact(conn, auth, cid)
         conn.execute("DELETE FROM contacts WHERE id=?", (cid,))
         return {"ok": True, "deleted_id": cid}

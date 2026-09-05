@@ -314,3 +314,103 @@ def test_owner_isolation_deals_and_stats():
     assert r.status_code == 404  # cannot create deal on someone else's contact
     deals = client.get("/api/deals").json()["deals"]
     assert all(d["title"] != "AdminSecret" for d in deals)
+
+
+# ── Migration: v3.1 DB without owner_id must upgrade safely ──────────────
+def test_migrate_legacy_db_adds_owner_column():
+    import sqlite3, importlib
+    # Build a legacy v3.1 database WITHOUT owner_id (file on disk, not env-swapped)
+    legacy = Path(_tmp) / "legacy31.db"
+    conn = sqlite3.connect(legacy)
+    conn.executescript("""
+        CREATE TABLE users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE, password_hash TEXT,
+            role TEXT DEFAULT 'member', created_at TEXT
+        );
+        INSERT INTO users (username, password_hash, role) VALUES ('legacyadmin', 'x', 'admin');
+        CREATE TABLE contacts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            first_name TEXT, last_name TEXT, email TEXT,
+            company TEXT, phone TEXT, status TEXT DEFAULT 'new',
+            created_at TEXT, updated_at TEXT
+        );
+        INSERT INTO contacts (first_name, last_name) VALUES ('Old', 'Contact');
+    """)
+    conn.commit(); conn.close()
+
+    # Point the app at the legacy DB, reload to run init+migrate
+    on = os.environ.get("CRM_DB")
+    try:
+        os.environ["CRM_DB"] = str(legacy)
+        importlib.reload(crm_app)
+        conn = sqlite3.connect(legacy)
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(contacts)").fetchall()}
+        assert "owner_id" in cols
+        # Backfilled owner = legacy admin id (id 1)
+        owner = conn.execute("SELECT owner_id FROM contacts LIMIT 1").fetchone()[0]
+        assert owner == 1
+        conn.close()
+    finally:
+        os.environ["CRM_DB"] = on
+        importlib.reload(crm_app)
+
+
+# ── Bearer API client creates contacts with valid owner (FK-safe) ────────
+def test_bearer_creates_contact_with_valid_owner():
+    # Bearer client is admin role, owner must be an existing users.id (api-bot)
+    r = client.post(
+        "/api/contacts",
+        json={"first_name": "BotContact"},
+        headers={"Authorization": "Bearer test-bearer-token"},
+    )
+    assert r.status_code == 200
+    cid = r.json()["id"]
+    with crm_app.get_db() as db:
+        owner = db.execute("SELECT owner_id FROM contacts WHERE id=?", (cid,)).fetchone()[0]
+        bot = db.execute("SELECT id FROM users WHERE username='api-bot'").fetchone()
+        assert bot is not None
+        assert owner == bot["id"]
+
+
+# ── Deleting a user with data is refused (no cascade data loss) ──────────
+def test_delete_user_with_data_refused():
+    _login_headers()
+    client.post("/api/users", json={"username": "datamember", "password": "strongpass123", "role": "member"})
+    client.post("/logout")
+    _create_member("datamember")
+    client.post("/api/contacts", json={"first_name": "Their Data"})
+    client.post("/logout")
+    _login_headers()
+    # datamember is now the last created user; find real id instead of hardcoding 3
+    with crm_app.get_db() as db:
+        uid = db.execute("SELECT id FROM users WHERE username='datamember'").fetchone()[0]
+    r = client.delete(f"/api/users/{uid}")
+    assert r.status_code == 409  # has data -> refused
+
+
+def test_delete_user_without_data_succeeds():
+    _login_headers()
+    client.post("/api/users", json={"username": "emptymember", "password": "strongpass123", "role": "member"})
+    with crm_app.get_db() as db:
+        uid = db.execute("SELECT id FROM users WHERE username='emptymember'").fetchone()[0]
+    r = client.delete(f"/api/users/{uid}")
+    assert r.status_code == 200
+
+
+# ── total respects search & status filters ───────────────────────────────
+def test_total_respects_filters():
+    _login_headers()
+    client.post("/api/contacts", json={"first_name": "Anna", "email": "anna@x.com", "status": "prospect"})
+    client.post("/api/contacts", json={"first_name": "Bob", "email": "bob@x.com", "status": "lead"})
+    client.post("/api/contacts", json={"first_name": "Cara", "email": "cara@x.com", "status": "won"})
+    r = client.get("/api/contacts?search=anna")
+    assert r.json()["total"] == 1
+    r = client.get("/api/contacts?status=prospect")
+    assert r.json()["total"] == 1
+    r = client.get("/api/contacts?status=lead")
+    assert r.json()["total"] == 1
+    r = client.get("/api/contacts?status=lead&search=bob")
+    assert r.json()["total"] == 1
+    r = client.get("/api/contacts?status=lead&search=anna")
+    assert r.json()["total"] == 0

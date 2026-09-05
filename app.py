@@ -88,7 +88,8 @@ async def require_auth(request: Request) -> dict:
     if API_TOKEN and auth.startswith("Bearer "):
         supplied = auth[7:]
         if hmac.compare_digest(supplied, API_TOKEN):
-            return {"id": 0, "username": "api-client", "role": "admin", "method": "bearer"}
+            # Real FK-safe user id (api-bot) so created records have valid owner_id
+            return {"id": API_BOT_ID, "username": "api-client", "role": "admin", "method": "bearer"}
     raise HTTPException(status_code=401, detail="Authentication required")
 
 def require_admin(user: dict = Depends(require_auth)) -> dict:
@@ -269,6 +270,54 @@ def init_db():
 
 init_db()
 
+def _column_names(db, table: str) -> set:
+    return {r[1] for r in db.execute(f"PRAGMA table_info({table})").fetchall()}
+
+def migrate_db():
+    """Idempotent migrations for databases created by older versions.
+    v3.1 -> v3.2 added contacts.owner_id; existing DBs lack it.
+    Also ensures users table exists for very old (v1/v2) databases."""
+    with get_db() as db:
+        # 1. Ensure users table exists (v1/v2 DBs never had it)
+        users_cols = _column_names(db, "users")
+        if not users_cols:
+            db.executescript("""
+                CREATE TABLE users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT NOT NULL UNIQUE,
+                    password_hash TEXT NOT NULL,
+                    role TEXT NOT NULL DEFAULT 'member' CHECK(role IN ('admin','member')),
+                    created_at TEXT DEFAULT (datetime('now'))
+                );
+            """)
+            print("🧬 Migration: created users table (legacy DB)")
+        # 2. Ensure contacts.owner_id exists (v3.1 -> v3.2)
+        contacts_cols = _column_names(db, "contacts")
+        if "owner_id" not in contacts_cols:
+            db.execute("ALTER TABLE contacts ADD COLUMN owner_id INTEGER NOT NULL DEFAULT 1")
+            print("🧬 Migration: added contacts.owner_id (v3.1 -> v3.2)")
+        # 3. Backfill owner_id for pre-migration rows (assign to first admin)
+        first_admin = db.execute(
+            "SELECT id FROM users WHERE role='admin' ORDER BY id LIMIT 1"
+        ).fetchone()
+        if first_admin:
+            db.execute(
+                "UPDATE contacts SET owner_id=? WHERE owner_id NOT IN (SELECT id FROM users)",
+                (first_admin["id"],),
+            )
+        # 4. Deal/activity tables never had owner_id — ownership flows via contacts
+        # 5. Ensure an api-bot user exists for Bearer-token API clients (FK-safe owner)
+        bot = db.execute("SELECT id FROM users WHERE username='api-bot'").fetchone()
+        if not bot:
+            db.execute(
+                "INSERT INTO users (username, password_hash, role) VALUES (?,?,?)",
+                ("api-bot", secrets.token_urlsafe(32), "admin"),
+            )
+            print("🧬 Migration: created api-bot user for Bearer clients")
+        db.commit()
+
+migrate_db()
+
 def seed_admin():
     """Insert the env-configured admin if not present."""
     with get_db() as db:
@@ -282,7 +331,18 @@ def seed_admin():
 
 seed_admin()
 
-# ── Login rate limiting (per-IP + per-username, in-memory) ────────────────
+def _get_api_bot_id() -> int:
+    """Return the id of the api-bot user (created in migration) — the FK-safe
+    owner for contacts created by Bearer-token API clients."""
+    with get_db() as db:
+        bot = db.execute("SELECT id FROM users WHERE username='api-bot'").fetchone()
+        if bot:
+            return bot["id"]
+        # fallback: first admin
+        admin = db.execute("SELECT id FROM users WHERE role='admin' ORDER BY id LIMIT 1").fetchone()
+        return admin["id"] if admin else 1
+
+API_BOT_ID = _get_api_bot_id()
 LOGIN_MAX_ATTEMPTS = 5
 LOGIN_WINDOW = 15 * 60  # 15 minutes
 # Rate limiting keys are IP + username. Using direct client IP only —
@@ -394,10 +454,24 @@ async def create_user(u: UserCreate):
 async def delete_user(uid: int, auth: dict = Depends(require_auth)):
     if uid == auth["id"]:
         raise HTTPException(400, "Cannot delete your own account")
+    if uid == API_BOT_ID:
+        raise HTTPException(400, "Cannot delete the system api-bot user")
     with get_db() as db:
-        row = db.execute("SELECT id FROM users WHERE id=?", (uid,)).fetchone()
+        row = db.execute(
+            "SELECT id, username FROM users WHERE id=?", (uid,)
+        ).fetchone()
         if not row:
             raise HTTPException(404, "User not found")
+        # Refuse to delete a user with owned data — would cascade-delete their CRM records.
+        contact_count = db.execute(
+            "SELECT COUNT(*) FROM contacts WHERE owner_id=?", (uid,)
+        ).fetchone()[0]
+        if contact_count > 0:
+            raise HTTPException(
+                409,
+                f"User '{row['username']}' owns {contact_count} contact(s); "
+                "reassign or delete their records first to prevent data loss",
+            )
         db.execute("DELETE FROM users WHERE id=?", (uid,))
         return {"ok": True, "deleted_id": uid}
 
@@ -411,27 +485,27 @@ async def list_contacts(
     auth: dict = Depends(require_auth),
 ):
     with get_db() as db:
-        q = "SELECT * FROM contacts WHERE 1=1"
+        # Build filter once — reuse for both rows and total count
+        where = ["1=1"]
         params = []
         if not is_admin(auth):
-            q += " AND owner_id=?"
+            where.append("owner_id=?")
             params.append(auth["id"])
         if search:
-            q += " AND (first_name||' '||last_name LIKE ? OR email LIKE ? OR company LIKE ?)"
+            where.append("(first_name||' '||last_name LIKE ? OR email LIKE ? OR company LIKE ?)")
             s = f"%{search}%"
             params.extend([s, s, s])
         if status:
-            q += " AND status = ?"
+            where.append("status = ?")
             params.append(status)
-        q += " ORDER BY updated_at DESC LIMIT ? OFFSET ?"
-        params.extend([limit, offset])
-        rows = [dict(r) for r in db.execute(q, params).fetchall()]
-        total_q = "SELECT COUNT(*) FROM contacts WHERE 1=1"
-        total_params = []
-        if not is_admin(auth):
-            total_q += " AND owner_id=?"
-            total_params.append(auth["id"])
-        total = db.execute(total_q, total_params).fetchone()[0]
+        where_sql = " AND ".join(where)
+        rows = [dict(r) for r in db.execute(
+            f"SELECT * FROM contacts WHERE {where_sql} ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+            params + [limit, offset],
+        ).fetchall()]
+        total = db.execute(
+            f"SELECT COUNT(*) FROM contacts WHERE {where_sql}", params
+        ).fetchone()[0]
         return {"contacts": rows, "total": total}
 
 @app.post("/api/contacts")
